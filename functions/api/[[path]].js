@@ -71,9 +71,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
     const url = new URL(request.url);
     const method = request.method;
     const db = env.DB;
-    const PROBE_SECRET = env.ADMIN_PASSWORD || "admin";
 
-    // 1. 探针公共大盘数据拉取
     if (method === 'GET' && subPath === 'public') {
         const settings = { theme: 'theme1', is_public: 'true', site_title: '⚡ Server Monitor Pro', show_price: 'true', show_expire: 'true', show_bw: 'true', show_tf: 'true', custom_css: '', custom_bg: '', custom_head: '', custom_script: '' };
         try { const { results } = await db.prepare('SELECT * FROM probe_settings').all(); if (results) results.forEach(r => settings[r.key] = r.value); } catch(e){}
@@ -95,7 +93,6 @@ async function handleProbeAPI(request, env, context, pathArray) {
         return Response.json({ settings, servers });
     }
 
-    // 2. 探针单机详情数据拉取
     if (method === 'GET' && subPath === 'detail') {
         const id = url.searchParams.get('id');
         const server = await db.prepare('SELECT * FROM probe_servers WHERE id = ?').bind(id).first();
@@ -103,10 +100,8 @@ async function handleProbeAPI(request, env, context, pathArray) {
         return Response.json(server);
     }
 
-    // --- 以下为需要管理员权限的 API ---
     if (!(await verifyAuth(request.headers.get("Authorization"), db, env))) return Response.json({error: "Unauthorized"}, {status: 401});
 
-    // 3. 探针后台管理：拉取所有数据
     if (method === 'GET' && subPath === 'admin/data') {
         const settings = {};
         try { const { results } = await db.prepare('SELECT * FROM probe_settings').all(); if (results) results.forEach(r => settings[r.key] = r.value); } catch(e){}
@@ -114,29 +109,19 @@ async function handleProbeAPI(request, env, context, pathArray) {
         return Response.json({ settings, servers });
     }
     
-    // 4. 探针后台管理：修改设置
     if (method === 'POST' && subPath === 'admin/settings') {
         const { settings } = await request.json();
         for (const [k, v] of Object.entries(settings)) { await db.prepare('INSERT INTO probe_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run(); }
         return Response.json({ success: true });
     }
 
-    // 5. 探针后台管理：增删改节点
-    if (method === 'POST' && subPath === 'admin/server') {
-        const data = await request.json(); const id = crypto.randomUUID();
-        await db.prepare(`INSERT INTO probe_servers (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden) VALUES (?, ?, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', ?, '{}', 'false')`).bind(id, data.name || 'New Server', data.agent_os || 'debian').run();
-        return Response.json({ success: true });
-    }
     if (method === 'PUT' && subPath === 'admin/server') {
         const data = await request.json();
         await db.prepare(`UPDATE probe_servers SET name=?, server_group=?, price=?, expire_date=?, bandwidth=?, traffic_limit=?, agent_os=?, is_hidden=? WHERE id=?`).bind(data.name || 'Unnamed', data.server_group || '默认分组', data.price || '', data.expire_date || '', data.bandwidth || '', data.traffic_limit || '', data.agent_os || 'debian', data.is_hidden || 'false', data.id).run();
         return Response.json({ success: true });
     }
-    if (method === 'DELETE' && subPath === 'admin/server') {
-        await db.prepare('DELETE FROM probe_servers WHERE id = ?').bind(url.searchParams.get('id')).run();
-        return Response.json({ success: true });
-    }
-
+    
+    // 我们不再允许在探针后台单独增加或删除机器，一切由 KUI 管理
     return Response.json({error: "Not Found"}, {status: 404});
 }
 
@@ -149,7 +134,6 @@ export async function onRequest(context) {
     const action = params.path ? params.path[0] : ''; 
     const db = env.DB; 
 
-    // 🌟 路由探针子系统 API
     if (action === "probe") {
         await ensureDbSchema(db);
         return await handleProbeAPI(request, env, context, params.path.slice(1));
@@ -319,7 +303,7 @@ export async function onRequest(context) {
         
         if (action === "vps" && isAdmin) {
             if (method === "POST") { const { ip, name } = await request.json(); await db.prepare("INSERT OR IGNORE INTO servers (ip, name, alert_sent) VALUES (?, ?, 0)").bind(ip, name).run(); return Response.json({ success: true }); }
-            if (method === "DELETE") { const ip = new URL(request.url).searchParams.get("ip"); await db.batch([ db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip), db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip), db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip) ]); return Response.json({ success: true }); }
+            if (method === "DELETE") { const ip = new URL(request.url).searchParams.get("ip"); await db.batch([ db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip), db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip), db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_servers WHERE id = ?").bind(ip) ]); return Response.json({ success: true }); }
         }
 
         if (action === "nodes" && isAdmin) {
