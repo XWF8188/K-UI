@@ -1,4 +1,4 @@
-name = "K-UI"
+name = "kui"
 compatibility_date = "2026-06-28"
 
 # 数据库绑定 (必须叫 DB)
