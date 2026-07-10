@@ -1178,7 +1178,7 @@
                     if (isFetchingProbe) return; isFetchingProbe = true;
                     try {
                         let authHeader = {};
-                        if (isLoggedIn.value) authHeader = {'Authorization': `${btoa(currentUser.value)}.${Date.now()}.${await generateHMAC(authKey.value, currentUser.value + Date.now())}`};
+                        if (isLoggedIn.value) { const ts = Date.now().toString(); authHeader = {'Authorization': `${btoa(currentUser.value)}.${ts}.${await generateHMAC(authKey.value, currentUser.value + ts)}`}; }
                         
                         if (probeDetailId.value) {
                             const res = await fetch(`/api/probe/detail?id=${probeDetailId.value}`, {headers: authHeader});
