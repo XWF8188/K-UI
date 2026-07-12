@@ -132,15 +132,14 @@ export class VpsPresence extends DurableObject {
     this.env = env;
     this.snapshot = { ip: "", core: null, proxy: null, updated_at: 0 };
     this.dashboardActive = false;
-    this.lastForwarded = 0;
     try { ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong")); } catch {}
     this.lastSeq = { core: -1, proxy: -1 };
     this.bootId = { core: "", proxy: "" };
-    this.lastPersisted = 0;
     ctx.blockConcurrencyWhile(async () => {
-      this.snapshot = (await ctx.storage.get("snapshot")) || this.snapshot;
-      this.lastSeq = (await ctx.storage.get("lastSeq")) || this.lastSeq;
-      this.bootId = (await ctx.storage.get("bootId")) || this.bootId;
+      const state = await ctx.storage.get("state");
+      this.snapshot = state?.snapshot || (await ctx.storage.get("snapshot")) || this.snapshot;
+      this.lastSeq = state?.lastSeq || (await ctx.storage.get("lastSeq")) || this.lastSeq;
+      this.bootId = state?.bootId || (await ctx.storage.get("bootId")) || this.bootId;
       this.dashboardActive = (await ctx.storage.get("dashboardActive")) || false;
     });
   }
@@ -203,7 +202,7 @@ export class VpsPresence extends DurableObject {
     this.lastSeq[role] = sequence;
     if (messageType === "hello") {
       this.snapshot[`${role}_capabilities`] = Array.isArray(envelope.data?.capabilities) ? envelope.data.capabilities.slice(0, 20) : [];
-      await this.ctx.storage.put({ lastSeq: this.lastSeq, bootId: this.bootId });
+      await this.ctx.storage.put("state", { snapshot: this.snapshot, lastSeq: this.lastSeq, bootId: this.bootId });
       return;
     }
     if (messageType === "config.result") {
@@ -221,11 +220,8 @@ export class VpsPresence extends DurableObject {
     this.snapshot[`${role}_connected`] = true;
     this.snapshot[`${role}_last_seen`] = Date.now();
     this.snapshot.updated_at = Date.now();
-    if (Date.now() - this.lastPersisted >= 60000) {
-      this.lastPersisted = Date.now();
-      await this.ctx.storage.put({ snapshot: this.snapshot, lastSeq: this.lastSeq, bootId: this.bootId });
-    }
-    if (criticalChange || Date.now() - this.lastForwarded >= 5000) await this.broadcast();
+    await this.ctx.storage.put("state", { snapshot: this.snapshot, lastSeq: this.lastSeq, bootId: this.bootId });
+    if (role === "core" || criticalChange) await this.broadcast();
   }
 
   async webSocketClose(ws) {
@@ -262,13 +258,12 @@ export class VpsPresence extends DurableObject {
 
   async persistAndBroadcast() {
     this.snapshot.updated_at = Date.now();
-    await this.ctx.storage.put("snapshot", this.snapshot);
+    await this.ctx.storage.put("state", { snapshot: this.snapshot, lastSeq: this.lastSeq, bootId: this.bootId });
     await this.broadcast();
   }
 
   async broadcast() {
     if (!this.dashboardActive) return;
-    this.lastForwarded = Date.now();
     const hub = this.env.DASHBOARD_HUB.get(this.env.DASHBOARD_HUB.idFromName("main"));
     await hub.fetch(new Request("https://hub.internal/update", {
       method: "POST",
@@ -314,7 +309,6 @@ export class DashboardHub extends DurableObject {
       if (request.headers.get("X-KUI-Presence") !== "1") return json({ error: "Forbidden" }, 403);
       const snapshot = await request.json();
       if (!snapshot.ip) return json({ error: "Invalid snapshot" }, 400);
-      await this.ctx.storage.put(`vps:${snapshot.ip}`, snapshot);
       const payload = JSON.stringify({ type: "patch", data: snapshot, ts: Date.now() });
       for (const ws of this.ctx.getWebSockets("dashboard")) {
         try { ws.send(payload); } catch {}

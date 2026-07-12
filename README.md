@@ -173,10 +173,10 @@ DEV 修复情况
 - `vps/realtime_client.py`：Core Agent 和 Proxy Manager 共用的 WebSocket 客户端。
 - `vps/agent.py`：每 5 秒发送 Core 状态，HTTP 仅负责低频持久化和 fallback。
 - `vps/lite_manager.py`：每 5 秒发送住宅通道状态，ACTIVE/STANDBY、出口和配置结果变化立即上报。
-- `realtime/src/index.js`：`VpsPresence` 每 5 秒最多向 `DashboardHub` 合并推送一次普通指标，关键变化不受合并周期限制。
+- `realtime/src/index.js`：`VpsPresence` 由 Core 的 5 秒状态驱动 Core+Proxy 合并快照，Proxy 主备/出口等关键变化额外立即推送；状态使用单行持久化，避免 Hibernation 导致重复写入和转发。
 - `index.html`：Dashboard WebSocket 健康时停止周期 Pages API 轮询，断线满 30 秒才恢复 HTTP。
 
-以 2 台同时运行 Core 和住宅代理的 VPS、1 个常开后台为例，WebSocket 消息和 DO-to-DO 合并请求折算后约 3.8 万次 Durable Objects 计费请求/天，低于免费版 10 万次/天；健康态 Pages HTTP 主要为每 15 分钟一次的持久化和配置校验。
+以 2 台同时运行 Core 和住宅代理的 VPS、1 个常开后台为例，WebSocket 消息和 DO-to-DO 合并请求折算后约 3.8 万次 Durable Objects 计费请求/天，单行状态写入约 6.9 万行/天，均低于免费版每日额度；健康态 Pages HTTP 主要为每 15 分钟一次的持久化和配置校验。
 
 ### 部署 Realtime Worker
 

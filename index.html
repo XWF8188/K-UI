@@ -404,7 +404,7 @@
                         <div class="p-6 md:p-8 relative">
                             <div class="flex justify-between items-start mb-4">
                                 <div>
-                                    <h3 class="font-black text-2xl text-slate-800 flex items-center gap-2 mb-1">{{ vps.name }}<span :class="isOnline(vps.last_report) ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-rose-400 shadow-[0_0_8px_rgba(251,113,133,0.8)]'" class="w-3 h-3 rounded-full inline-block"></span></h3>
+                                    <h3 class="font-black text-2xl text-slate-800 flex items-center gap-2 mb-1">{{ vps.name }}<span :class="vps.realtime_state === 'stale' ? 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]' : (isOnline(vps.last_report, vps.realtime_state) ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-rose-400 shadow-[0_0_8px_rgba(251,113,133,0.8)]')" class="w-3 h-3 rounded-full inline-block"></span></h3>
                                     <p class="text-sm font-mono text-slate-400 font-medium">{{ vps.ip }}</p>
                                 </div>
                                 <button @click="deleteVps(vps.ip)" class="text-slate-300 hover:text-rose-500 font-bold transition-all">彻底移除</button>
@@ -1062,7 +1062,7 @@
                 watch(() => probeSys.custom_bg, updateCustomStyles);
                 watch(() => probeSys.custom_script, updateCustomScript);
 
-                const isOnline = (lastReport) => lastReport && (Date.now() - lastReport) < 240000;
+                const isOnline = (lastReport, realtimeState = '') => realtimeState ? realtimeState === 'online' : !!lastReport && (Date.now() - lastReport) < 240000;
                 const formatBytes = (bytes) => { const b = parseInt(bytes); if (isNaN(b) || b === 0) return '0 B'; const k = 1024, sizes = ['B', 'KB', 'MB', 'GB', 'TB'], i = Math.floor(Math.log(b) / Math.log(k)); return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]; };
                 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
                 const formatDate = (ts) => { if (!ts) return '永久'; const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
@@ -1070,7 +1070,7 @@
                 const getTrafficPercent = (used, limit) => { if (!limit || limit === 0) return 0; return Math.min((used / limit) * 100, 100); };
                 const getPingColor = (ping) => { const p = parseInt(ping); if (p === 0 || isNaN(p)) return '#9ca3af'; if (p < 100) return '#10b981'; if (p < 200) return '#f59e0b'; return '#ef4444'; };
 
-                const globalOnline = computed(() => servers.value.filter(s => isOnline(s.last_report)).length);
+                const globalOnline = computed(() => servers.value.filter(s => isOnline(s.last_report, s.realtime_state)).length);
                 const globalTraffic = computed(() => nodes.value.reduce((sum, n) => sum + (parseFloat(n.traffic_used) || 0), 0));
                 const globalSpeedIn = computed(() => servers.value.reduce((sum, s) => sum + (parseFloat(s.net_in_speed) || 0), 0));
                 const globalSpeedOut = computed(() => servers.value.reduce((sum, s) => sum + (parseFloat(s.net_out_speed) || 0), 0));
@@ -1084,7 +1084,7 @@
                     });
                 });
 
-                const probeGlobalOnline = computed(() => publicProbeServers.value.filter(s => isOnline(s.last_updated)).length);
+                const probeGlobalOnline = computed(() => publicProbeServers.value.filter(s => isOnline(s.last_updated, s.realtime_state)).length);
                 const probeGlobalOffline = computed(() => publicProbeServers.value.length - probeGlobalOnline.value);
                 const probeGlobalSpeedIn = computed(() => publicProbeServers.value.reduce((sum, s) => sum + (parseFloat(s.net_in_speed)||0), 0));
                 const probeGlobalSpeedOut = computed(() => publicProbeServers.value.reduce((sum, s) => sum + (parseFloat(s.net_out_speed)||0), 0));
