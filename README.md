@@ -149,25 +149,68 @@ DEV 修复情况
 1. **D1 数据库绑定**：
    - 变量名称：`DB`（**必须严格匹配**）
    - 选择您在第一步中创建的数据库（如 `kui-db`）
+   - `ASSETS` 由 Cloudflare Pages 自动提供，用于鉴权安装器和 Agent 组件下载，不需要手工创建
+   - 请按本文使用 **Cloudflare Pages** 部署；若改成普通 Worker 且没有 `ASSETS` 绑定，`/api/agent_update` 会返回 `503`
 
-2. **环境变量**（Environment Variables）：
-   | 变量名 | 说明 | 默认值 | 必填 |
-   |---|---|---|---|
-   | `ADMIN_USERNAME` | 后台登录账号 | 不建议使用默认值 | ✅ |
-   | `ADMIN_PASSWORD` | 后台强密码 | 不建议使用默认值 | ✅ |
-   | `TG_BOT_TOKEN` | Telegram 机器人 Token | - | ❌ |
-   | `TG_CHAT_ID` | 接收告警的 Telegram Chat ID | - | ❌ |
-   | `TG_WEBHOOK_SECRET` | Telegram Webhook 校验密钥，启用 TG 管理时必填 | - | ❌ |
-   | `CRON_SECRET` | 外部定时任务调用 `/api/cron_check` 的 Bearer 密钥 | - | ❌ |
-   | `LEGACY_AGENT_AUTH` | 设为 `false` 可提前关闭旧 Agent 迁移兼容 | 临时启用至 2026-08-01 | ❌ |
-   | `PROXY_USER` | 住宅 SOCKS5 用户名，启用住宅代理时必须显式配置 | - | ❌ |
-   | `PROXY_PASS` | 住宅 SOCKS5 强密码，启用住宅代理时必须显式配置 | - | ❌ |
-   | `PROXY_CTRL_URL` | 使用外部住宅代理控制器时填写其根 URL；内置 D1 控制器留空 | - | ❌ |
-   | `PROXY_CTRL_TOKEN` | 外部控制器专用 Token | - | ❌ |
-   | `PROXY_CTRL_USER` | 外部控制器 Basic Auth 用户名 | - | ❌ |
-   | `PROXY_CTRL_PASS` | 外部控制器 Basic Auth 密码 | - | ❌ |
+2. **环境变量**（Environment Variables）
 
-> ⚠️ **安全提示**：不要使用 `admin/admin`、`proxy/888888` 等默认凭据。`PROXY_USER` 和 `PROXY_PASS` 未配置时，内置住宅代理 API 会返回 `503`，代理监听器也会拒绝连接。
+#### 基础必填
+
+| 变量名 | 说明 | 示例 | 必填 |
+|---|---|---|---|
+| `ADMIN_USERNAME` | KUI 后台管理员用户名 | `kui_admin` | ✅ |
+| `ADMIN_PASSWORD` | KUI 后台管理员强密码 | 随机 24 位以上 | ✅ |
+| `PROXY_USER` | Full Deploy 安装的住宅 SOCKS5 用户名 | `res_proxy` | ✅ |
+| `PROXY_PASS` | 住宅 SOCKS5 强密码 | 随机 32 位以上 | ✅ |
+
+虽然 Worker 代码对管理员账号保留了兼容默认值，但生产部署必须显式设置管理员账号和密码。`PROXY_USER`、`PROXY_PASS` 没有可用默认值；缺少任意一个时，住宅代理 API 返回 `503`，SOCKS5 监听器拒绝连接。
+
+可以在本地生成随机密码：
+
+```bash
+openssl rand -base64 32
+```
+
+#### Telegram 与定时告警（可选）
+
+| 变量名 | 说明 | 使用条件 |
+|---|---|---|
+| `TG_BOT_TOKEN` | Telegram Bot Token | 启用 Telegram 通知时配置 |
+| `TG_CHAT_ID` | 接收告警的 Chat ID | 启用 Telegram 通知时配置 |
+| `TG_WEBHOOK_SECRET` | Telegram Webhook 来源校验密钥 | 启用 Telegram 命令管理时必须配置 |
+| `CRON_SECRET` | `/api/cron_check` 的 Bearer 密钥 | 使用外部 Cron 检查离线节点时配置 |
+
+#### 迁移开关（可选）
+
+| 变量名 | 说明 | 默认行为 |
+|---|---|---|
+| `LEGACY_AGENT_AUTH` | 设置为精确字符串 `false` 可关闭旧管理员哈希 Agent 兼容 | 临时兼容至 2026-08-01 UTC |
+
+新部署无需设置此变量。历史 VPS 全部重新执行 Full Deploy Command 后，建议立即设置 `LEGACY_AGENT_AUTH=false` 并重新部署 Pages。
+
+#### 外部住宅控制器（高级，可选）
+
+| 变量名 | 说明 |
+|---|---|
+| `PROXY_CTRL_URL` | 外部住宅控制器根 URL；使用内置 D1 控制器时必须留空 |
+| `PROXY_CTRL_TOKEN` | 外部控制器专用 Token |
+| `PROXY_CTRL_USER` | 外部控制器 Basic Auth 用户名 |
+| `PROXY_CTRL_PASS` | 外部控制器 Basic Auth 密码 |
+
+`PROXY_CTRL_TOKEN` 与 Basic Auth 二选一；同时显式配置 `PROXY_CTRL_USER` 和 `PROXY_CTRL_PASS` 时优先使用 Basic Auth，否则使用 `PROXY_CTRL_TOKEN`。配置 `PROXY_CTRL_URL` 后，系统进入外部控制器模式。由于外部控制器凭据与 KUI Agent Token 不同，Full Deploy Command 会明确停止住宅阶段，避免把 KUI Token 错发给外部服务。默认一条命令全量部署时，**不要设置 `PROXY_CTRL_URL`**。
+
+#### 不是 Pages 环境变量的选项
+
+以下变量只用于 VPS 进程的高级手工配置，不要填到 Cloudflare Pages 后期待自动下发：
+
+| 变量名 | 默认值 | 说明 |
+|---|---|---|
+| `PROXY_PORT` | `7920` | VPS 本地住宅代理监听端口 |
+| `PROXY_MAX_CONNECTIONS` | `256` | 单台 VPS 最大并发代理连接数，最低为 16 |
+| `PROXY_API_URL` | 当前 KUI 域名 | 统一 Agent 使用的住宅代理 API 根地址 |
+| `C2_API_PREFIX` | `/api/proxy` | 住宅管理器控制器 API 前缀 |
+
+> ⚠️ **安全提示**：不要使用 `admin/admin`、`proxy/888888` 等弱凭据。Deploy Command 包含服务器专属 Agent Token，只能在对应 VPS 的 root Shell 中执行，不要粘贴到公开 Issue、聊天群或命令日志。
 
 > Cloudflare 的 **Production** 与 **Preview** 环境变量、D1 绑定相互独立。若生产分支为 `dev`，请确认该分支对应环境已经绑定 `DB` 并配置上述变量。修改变量后必须重新部署。
 
@@ -295,11 +338,11 @@ PROXY_PASS=随机强密码
 
 ### 3. 仅重装住宅代理（可选）
 
-正常部署不需要执行以下命令。仅当统一 Agent 正常、但需要单独修复或重装住宅代理组件时使用：
+正常部署不需要执行以下命令。仅当统一 Agent 正常、但需要单独修复或重装住宅代理组件时使用。以下修复命令同样通过鉴权 API 获取当前安装器，不使用可能被 CDN 缓存的公开静态脚本：
 
 ```bash
 # Debian / Ubuntu
-bash <(curl -fsSL https://您的域名/vps/residential-proxy.sh) \
+bash <(curl -fsSL -H 'Authorization: 服务器专属AgentToken' 'https://您的域名/api/agent_update?ip=您的VPS_IP&component=proxy-installer') \
   --domain https://您的域名 \
   --controller https://您的域名 \
   --ip 您的VPS_IP \
@@ -307,7 +350,7 @@ bash <(curl -fsSL https://您的域名/vps/residential-proxy.sh) \
 
 # Alpine（住宅代理脚本需要 Bash，不能用 sh 执行）
 apk add --no-cache bash curl
-curl -fsSL --ipv4 https://您的域名/vps/residential-proxy.sh | bash -s -- \
+curl -fsSL --ipv4 -H 'Authorization: 服务器专属AgentToken' 'https://您的域名/api/agent_update?ip=您的VPS_IP&component=proxy-installer' | bash -s -- \
   --domain https://您的域名 \
   --controller https://您的域名 \
   --ip 您的VPS_IP \

@@ -566,8 +566,8 @@ async function proxyBridge(method, subPath, request, env) {
     if (currentOrigin === targetOrigin) return await proxyLocal(method, subPath, request, env);
     const target = ctrlUrl.replace(/\/+$/, '') + '/api/' + subPath;
     let authHeader = '';
-    const ctrlUser = env.PROXY_CTRL_USER || env.ADMIN_USERNAME || '';
-    const ctrlPass = env.PROXY_CTRL_PASS || env.ADMIN_PASSWORD || '';
+    const ctrlUser = env.PROXY_CTRL_USER || '';
+    const ctrlPass = env.PROXY_CTRL_PASS || '';
     if (ctrlUser && ctrlPass) {
       const encoded = btoa(`${ctrlUser}:${ctrlPass}`);
       authHeader = `Basic ${encoded}`;
