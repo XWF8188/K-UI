@@ -9,6 +9,8 @@ import re
 import sys
 import base64
 import socket
+import platform
+import tempfile
 from datetime import datetime
 
 # 强制系统编码锁
@@ -65,6 +67,10 @@ global_interval = 5
 
 # 🌟 增加全局 Ping 状态缓存锁，防止在非测速轮次上传 '0' 导致前端图表归零
 last_pings = {"ct": "0", "cu": "0", "cm": "0", "bd": "0"}
+dynamic_ping = {"ct": None, "cu": None, "cm": None}
+pending_report_id = None
+pending_report_bytes = None
+pending_node_traffic = None
 
 # --- 缓存静态信息 ---
 cached_os = cached_arch = cached_cpu_info = cached_virt = None
@@ -91,12 +97,17 @@ def get_static_sysinfo():
     if not cached_virt:
         virt = os.popen('systemd-detect-virt 2>/dev/null').read().strip()
         if not virt or virt == 'none':
-            if 'lxc' in open('/proc/1/environ', 'r', errors='ignore').read(): virt = 'lxc'
-            elif 'docker' in open('/proc/1/environ', 'r', errors='ignore').read(): virt = 'docker'
-            elif os.path.exists('/proc/user_beancounters'): virt = 'openvz'
-            elif 'kvm' in open('/proc/cpuinfo', 'r', errors='ignore').read().lower(): virt = 'kvm'
-            elif 'qemu' in open('/proc/cpuinfo', 'r', errors='ignore').read().lower(): virt = 'qemu'
-            else: virt = "KVM/Physical"
+            try:
+                with open('/proc/1/environ', 'r', errors='ignore') as f: init_env = f.read()
+                with open('/proc/cpuinfo', 'r', errors='ignore') as f: cpu_info = f.read().lower()
+                if 'lxc' in init_env: virt = 'lxc'
+                elif 'docker' in init_env: virt = 'docker'
+                elif os.path.exists('/proc/user_beancounters'): virt = 'openvz'
+                elif 'kvm' in cpu_info: virt = 'kvm'
+                elif 'qemu' in cpu_info: virt = 'qemu'
+                else: virt = "KVM/Physical"
+            except Exception:
+                virt = "Unknown"
         cached_virt = virt.upper()
     return cached_os, cached_arch, cached_cpu_info, cached_virt
 
@@ -276,9 +287,9 @@ def get_system_status(current_interval):
         if idx == 0: ct, cu, cm = "bj-ct-dualstack.ip.zstaticcdn.com", "bj-cu-dualstack.ip.zstaticcdn.com", "bj-cm-dualstack.ip.zstaticcdn.com"
         elif idx == 1: ct, cu, cm = "sh-ct-dualstack.ip.zstaticcdn.com", "sh-cu-dualstack.ip.zstaticcdn.com", "sh-cm-dualstack.ip.zstaticcdn.com"
         else: ct, cu, cm = "gd-ct-dualstack.ip.zstaticcdn.com", "gd-cu-dualstack.ip.zstaticcdn.com", "gd-cm-dualstack.ip.zstaticcdn.com"
-        last_pings["ct"] = get_http_ping(ct)
-        last_pings["cu"] = get_http_ping(cu)
-        last_pings["cm"] = get_http_ping(cm)
+        last_pings["ct"] = get_http_ping(dynamic_ping["ct"] or ct)
+        last_pings["cu"] = get_http_ping(dynamic_ping["cu"] or cu)
+        last_pings["cm"] = get_http_ping(dynamic_ping["cm"] or cm)
         last_pings["bd"] = get_http_ping("lf3-ips.zstaticcdn.com")
 
     # 把最近一次成功的 Ping 值塞入状态发给后端，避免前端由于读到0产生断崖
@@ -294,30 +305,92 @@ def get_system_status(current_interval):
     return stats
 
 def ensure_cloudflared():
-    if not os.path.exists("/usr/local/bin/cloudflared"):
-        os.system("curl -L -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x /usr/local/bin/cloudflared")
+    target = "/usr/local/bin/cloudflared"
+    if os.path.isfile(target) and os.path.getsize(target) > 0:
+        return True
+    arch_map = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "arm"}
+    arch = arch_map.get(platform.machine().lower())
+    if not arch:
+        return False
+    fd, tmp_path = tempfile.mkstemp(prefix="cloudflared-", dir="/usr/local/bin")
+    os.close(fd)
+    try:
+        result = subprocess.run(["curl", "-fL", "--retry", "3", "-o", tmp_path, f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"], timeout=120)
+        if result.returncode != 0 or os.path.getsize(tmp_path) == 0:
+            return False
+        os.chmod(tmp_path, 0o755)
+        os.replace(tmp_path, target)
+        return True
+    except Exception:
+        return False
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+def stop_process(process):
+    if not process:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=3)
+    except Exception:
+        try: process.kill(); process.wait(timeout=3)
+        except Exception: pass
 
 def process_argo_nodes(configs):
     argo_urls = []
     expected_ports = [str(n['port']) for n in configs if n.get('protocol') == 'VLESS-Argo']
+    for port in list(argo_tunnels.keys()):
+        if argo_tunnels[port]["proc"].poll() is not None:
+            stop_process(argo_tunnels[port]["proc"])
+            argo_tunnels[port].get("log_file") and argo_tunnels[port]["log_file"].close()
+            del argo_tunnels[port]
     for port in expected_ports:
         if port not in argo_tunnels:
-            ensure_cloudflared()
+            if not ensure_cloudflared():
+                continue
             cmd = ["/usr/local/bin/cloudflared", "tunnel", "--edge-ip-version", "auto", "--no-autoupdate", "--url", f"http://[::1]:{port}"]
-            p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+            log_path = f"/opt/kui/argo_{port}.log"
+            log_file = open(log_path, "w+")
+            p = subprocess.Popen(cmd, stderr=log_file, stdout=subprocess.DEVNULL, text=True)
             url = None; start_t = time.time()
             while time.time() - start_t < 15:
-                line = p.stderr.readline()
-                if not line: break
-                m = re.search(r'https://([a-zA-Z0-9-]+\.trycloudflare\.com)', line)
-                if m: url = m.group(1); break
-            if url: argo_tunnels[port] = {"proc": p, "url": url}
+                if p.poll() is not None: break
+                log_file.flush(); log_file.seek(0)
+                match = re.search(r'https://([a-zA-Z0-9-]+\.trycloudflare\.com)', log_file.read())
+                if match: url = match.group(1); break
+                time.sleep(0.5)
+            if url: argo_tunnels[port] = {"proc": p, "url": url, "log_file": log_file}
+            else: stop_process(p); log_file.close()
         if port in argo_tunnels: argo_urls.append({"id": [n['id'] for n in configs if str(n['port'])==port][0], "url": argo_tunnels[port]["url"]})
     for port in list(argo_tunnels.keys()):
         if port not in expected_ports:
-            argo_tunnels[port]["proc"].terminate()
+            stop_process(argo_tunnels[port]["proc"])
+            argo_tunnels[port].get("log_file") and argo_tunnels[port]["log_file"].close()
             del argo_tunnels[port]
     return argo_urls
+
+def build_chain_outbound(target, tag):
+    proto = target.get("protocol", "")
+    outbound = {"tag": tag, "server": target["ip"], "server_port": int(target["port"])}
+    if proto in ["VLESS", "XTLS-Reality", "Reality", "H2-Reality", "gRPC-Reality"]:
+        outbound.update({"type": "vless", "uuid": target["uuid"]})
+        if "Reality" in proto:
+            outbound["tls"] = {"enabled": True, "server_name": target.get("sni") or "addons.mozilla.org", "reality": {"enabled": True, "public_key": target.get("public_key", ""), "short_id": target.get("short_id", "")}}
+        if proto in ["XTLS-Reality", "Reality"]: outbound["flow"] = "xtls-rprx-vision"
+        if proto == "H2-Reality": outbound["transport"] = {"type": "http"}
+        if proto == "gRPC-Reality": outbound["transport"] = {"type": "grpc", "service_name": "grpc"}
+    elif proto == "Trojan":
+        outbound.update({"type": "trojan", "password": target.get("password", ""), "tls": {"enabled": True, "server_name": target.get("sni") or "addons.mozilla.org", "insecure": True}})
+    elif proto == "Hysteria2":
+        outbound.update({"type": "hysteria2", "password": target.get("uuid") or target.get("password", ""), "tls": {"enabled": True, "server_name": target.get("sni") or "addons.mozilla.org", "insecure": True}})
+    elif proto == "TUIC":
+        outbound.update({"type": "tuic", "uuid": target["uuid"], "password": target.get("password", ""), "tls": {"enabled": True, "server_name": target.get("sni") or "addons.mozilla.org", "insecure": True}})
+    elif proto == "AnyTLS":
+        outbound.update({"type": "anytls", "password": target.get("password", ""), "tls": {"enabled": True, "server_name": target.get("sni") or "addons.mozilla.org", "insecure": True}})
+    else:
+        return None
+    return outbound
 
 def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_outbound=None):
     singbox_config = {
@@ -342,7 +415,8 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
                 with open(conf_path, "w") as f: f.write(f"[req]\ndistinguished_name = req_distinguished_name\nx509_extensions = v3_req\nprompt = no\n[req_distinguished_name]\nCN = {cn}\n[v3_req]\nsubjectAltName = @alt_names\n[alt_names]\nDNS = {sni}\n")
                 os.system(f"openssl ecparam -genkey -name prime256v1 -out {key_path} >/dev/null 2>&1")
                 os.system(f"openssl req -new -x509 -days 36500 -key {key_path} -out {cert_path} -config {conf_path} -extensions v3_req >/dev/null 2>&1")
-                os.system(f"chmod 644 {cert_path} {key_path}")
+                os.chmod(cert_path, 0o644)
+                os.chmod(key_path, 0o600)
                 try: os.remove(conf_path)
                 except: pass
         
@@ -362,10 +436,11 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
             out_tag = f"out-{node['id']}"
             if node.get("relay_type") == "internal" and node.get("chain_target"):
                 t = node["chain_target"]
-                outbound = { "type": t["protocol"].lower(), "tag": out_tag, "server": t["ip"], "server_port": int(t["port"]), "uuid": t["uuid"] }
-                if t["protocol"] == "Reality" or t["protocol"] == "XTLS-Reality":
-                    outbound["tls"] = { "enabled": True, "server_name": t["sni"], "reality": { "enabled": True, "public_key": t["public_key"], "short_id": t["short_id"] } }
-                singbox_config["outbounds"].append(outbound)
+                outbound = build_chain_outbound(t, out_tag)
+                if outbound:
+                    singbox_config["outbounds"].append(outbound)
+                else:
+                    continue
             else:
                 singbox_config["outbounds"].append({ "type": "direct", "tag": out_tag, "override_address": node["target_ip"], "override_port": int(node["target_port"]) })
             singbox_config["route"]["rules"].append({ "inbound": [in_tag], "outbound": out_tag })
@@ -526,46 +601,49 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
 
     if new_config_str != old_config_str:
         with open(SINGBOX_CONF_PATH, "w") as f: f.write(new_config_str)
+        os.chmod(SINGBOX_CONF_PATH, 0o600)
         if os.path.exists("/sbin/openrc-run") or os.path.exists("/etc/alpine-release"): os.system("rc-service sing-box restart >/dev/null 2>&1")
         else: os.system("systemctl restart sing-box >/dev/null 2>&1")
 
 def report_status(current_nodes, argo_urls):
-    global last_reported_bytes, global_interval
+    global last_reported_bytes, global_interval, dynamic_ping, pending_report_id, pending_report_bytes, pending_node_traffic
     status = get_system_status(global_interval)
     status["ip"] = VPS_IP
     status["argo_urls"] = argo_urls
     
     deltas = []
+    pending_bytes = dict(last_reported_bytes)
     current_ids = set()
     for node in current_nodes:
         nid, port = node["id"], node["port"]
         current_ids.add(nid)
         proto = "udp" if node["protocol"] in ["Hysteria2", "TUIC"] else "tcp"
         current_bytes = get_port_traffic(port, proto)
-        delta = current_bytes - last_reported_bytes.get(nid, current_bytes)
+        delta = current_bytes - pending_bytes.get(nid, current_bytes)
         if delta > 0: deltas.append({ "id": nid, "delta_bytes": delta })
-        last_reported_bytes[nid] = current_bytes
+        pending_bytes[nid] = current_bytes
 
-    last_reported_bytes = {k: v for k, v in last_reported_bytes.items() if k in current_ids}
-    status["node_traffic"] = deltas
+    if not pending_report_id:
+        pending_report_id = f"{VPS_IP}:{time.time_ns()}"
+        pending_report_bytes = {k: v for k, v in pending_bytes.items() if k in current_ids}
+        pending_node_traffic = deltas
+    status["node_traffic"] = pending_node_traffic
+    status["report_id"] = pending_report_id
 
     try: 
         req = urllib.request.Request(REPORT_URL, data=json.dumps(status).encode(), headers=HEADERS)
         res = urllib.request.urlopen(req, timeout=5)
         resp_data = json.loads(res.read().decode('utf-8'))
+        last_reported_bytes = pending_report_bytes
+        pending_report_id = None
+        pending_report_bytes = None
+        pending_node_traffic = None
         if resp_data and "interval" in resp_data:
             global_interval = max(1, int(resp_data["interval"]))
+        for key in ("ct", "cu", "cm"):
+            value = resp_data.get(f"ping_{key}")
+            dynamic_ping[key] = None if not value or value == "default" else value
     except Exception as e: pass
-
-def register_self():
-    try:
-        base_url = API_URL.rsplit('/', 1)[0]
-        vps_api = f"{base_url}/vps"
-        data = json.dumps({"ip": VPS_IP, "name": f"VPS-{VPS_IP}"}).encode()
-        req = urllib.request.Request(vps_api, data=data, headers={**HEADERS, 'Content-Type': 'application/json'})
-        urllib.request.urlopen(req, timeout=5)
-    except Exception:
-        pass
 
 def fetch_proxy_config():
     try:
@@ -615,7 +693,7 @@ def fetch_proxy_mesh(country="ANY"):
                 user = parsed.username or PROXY_USER
                 pwd = parsed.password or PROXY_PASS
                 if host:
-                    peers.append({"socks_ip": host, "port": port, "user": user, "pass": pwd, "country": peer_country})
+                    peers.append({"ip": host, "socks_ip": host, "port": port, "user": user, "pass": pwd, "country": peer_country})
             except Exception:
                 continue
         return peers
@@ -666,7 +744,7 @@ def fetch_and_apply_configs():
                 peers = fetch_proxy_mesh(mesh.get("country", "ANY"))
                 exit_ip = mesh.get("exit")
                 if exit_ip and exit_ip != "ANY":
-                    peers = [p for p in peers if p.get("ip") == exit_ip]
+                    peers = [p for p in peers if p.get("socks_ip") == exit_ip or p.get("ip") == exit_ip]
             socks5_outbound = data.get("socks5_outbound", {})
             build_singbox_config(nodes, current_proxy_config, peers, mesh, socks5_outbound)
             return nodes
@@ -677,11 +755,13 @@ def fetch_and_apply_configs():
 if __name__ == "__main__":
     current_active_nodes = []
     time.sleep(2)
-    register_self()
     while True:
-        fetched_nodes = fetch_and_apply_configs()
-        if fetched_nodes is not None: current_active_nodes = fetched_nodes
-        argo_urls = process_argo_nodes(current_active_nodes)
-        report_status(current_active_nodes, argo_urls)
-        report_proxy_status()
+        try:
+            fetched_nodes = fetch_and_apply_configs()
+            if fetched_nodes is not None: current_active_nodes = fetched_nodes
+            argo_urls = process_argo_nodes(current_active_nodes)
+            report_status(current_active_nodes, argo_urls)
+            report_proxy_status()
+        except Exception as error:
+            print(f"[agent] main loop error: {error}", flush=True)
         time.sleep(global_interval)

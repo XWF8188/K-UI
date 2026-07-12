@@ -12,11 +12,15 @@ set -euo pipefail
 
 DOMAIN=""
 CONTROLLER=""
+AGENT_TOKEN=""
+VPS_IP=""
 
 while [ "$#" -gt 0 ]; do
     case $1 in
         --domain) DOMAIN="$2"; shift 2 ;;
         --controller) CONTROLLER="$2"; shift 2 ;;
+        --token) AGENT_TOKEN="$2"; shift 2 ;;
+        --ip) VPS_IP="$2"; shift 2 ;;
         *) echo "未知参数: $1"; exit 1 ;;
     esac
 done
@@ -28,10 +32,20 @@ fi
 if [ -z "$CONTROLLER" ]; then
     CONTROLLER="$DOMAIN"
 fi
+if [ -z "$AGENT_TOKEN" ]; then
+    echo "❌ 错误: 缺少 --token (服务器专属 Agent Token)"
+    exit 1
+fi
+if [ -z "$VPS_IP" ]; then
+    echo "❌ 错误: 缺少 --ip (面板登记的服务器 IP)"
+    exit 1
+fi
 
 export C2_URL="$CONTROLLER"
 export WEB_USER="${WEB_USER:-admin}"
 export WEB_PASS="${WEB_PASS:-admin888}"
+export AGENT_TOKEN
+export VPS_IP
 
 echo "=========================================================="
 echo "     Proxy Controller (Active-Standby Multi-Tunnel)    "
@@ -158,6 +172,10 @@ download_agents() {
         echo "❌ 下载 proxy_server.py 失败，请检查域名: ${DOMAIN}/vps/proxy_server.py"
         exit 1
     }
+    python3 -m py_compile lite_manager.py proxy_server.py || {
+        echo "❌ 下载的代理引擎不是有效 Python 文件"
+        exit 1
+    }
     chmod 644 /opt/proxy_lite/lite_manager.py /opt/proxy_lite/proxy_server.py
     echo "[+] 引擎文件下载完成"
 }
@@ -183,6 +201,8 @@ Environment="WEB_USER=${WEB_USER:-admin}"
 Environment="WEB_PASS=${WEB_PASS:-admin888}"
 Environment="PROXY_USER=${PROXY_USER:-proxy}"
 Environment="PROXY_PASS=${PROXY_PASS:-888888}"
+Environment="AGENT_TOKEN=${AGENT_TOKEN:-}"
+Environment="VPS_IP=${VPS_IP:-}"
 Environment="PYTHONIOENCODING=utf-8"
 Environment="LANG=C.UTF-8"
 WorkingDirectory=/opt/proxy_lite
@@ -214,6 +234,8 @@ export WEB_USER="${WEB_USER:-admin}"
 export WEB_PASS="${WEB_PASS:-admin888}"
 export PROXY_USER="${PROXY_USER:-proxy}"
 export PROXY_PASS="${PROXY_PASS:-888888}"
+export AGENT_TOKEN="${AGENT_TOKEN:-}"
+export VPS_IP="${VPS_IP:-}"
 export PYTHONIOENCODING="utf-8"
 export LANG="C.UTF-8"
 depend() {
@@ -235,6 +257,8 @@ export WEB_USER="${WEB_USER:-admin}"
 export WEB_PASS="${WEB_PASS:-admin888}"
 export PROXY_USER="${PROXY_USER:-proxy}"
 export PROXY_PASS="${PROXY_PASS:-888888}"
+export AGENT_TOKEN="${AGENT_TOKEN:-}"
+export VPS_IP="${VPS_IP:-}"
 export PYTHONIOENCODING=utf-8
 export LANG=C.UTF-8
 cd /opt/proxy_lite

@@ -1,5 +1,7 @@
 #!/bin/sh
 
+set -eu
+
 # ==========================================
 # KUI Serverless 集群节点 - 智能跨系统安装脚本 (工业级加固版)
 # 支持: Ubuntu 18-24 / Debian 10-13 / Alpine Linux
@@ -23,11 +25,16 @@ fi
 
 if [ -f /etc/os-release ]; then
     . /etc/os-release
-    OS=$ID
+    OS="${ID:-}"
 else
     echo "❌ 无法识别操作系统，脚本退出。"
     exit 1
 fi
+
+case "$OS" in
+    alpine|debian|ubuntu) ;;
+    *) echo "不支持的发行版: $OS"; exit 1 ;;
+esac
 
 echo "=========================================="
 echo " 🚀 KUI Agent 智能安装启动中..."
@@ -60,7 +67,7 @@ else
     fi
     case "$OS" in
         debian)
-            DEB_VERSION="$(awk -F'[= ]' '/VERSION_CODENAME/{print $NF}' /etc/os-release 2>/dev/null || echo bookworm)"
+            DEB_VERSION="${VERSION_CODENAME:-bookworm}"
             cat > /etc/apt/sources.list <<EOF
 deb http://mirrors.aliyun.com/debian ${DEB_VERSION} main contrib non-free non-free-firmware
 deb http://mirrors.aliyun.com/debian ${DEB_VERSION}-updates main contrib non-free non-free-firmware
@@ -68,7 +75,7 @@ deb http://mirrors.aliyun.com/debian-security ${DEB_VERSION}-security main contr
 EOF
             ;;
         ubuntu)
-            UBUNTU_CODENAME="$(awk -F'[= ]' '/VERSION_CODENAME/{print $NF}' /etc/os-release 2>/dev/null || echo jammy)"
+            UBUNTU_CODENAME="${VERSION_CODENAME:-jammy}"
             cat > /etc/apt/sources.list <<EOF
 deb http://mirrors.aliyun.com/ubuntu ${UBUNTU_CODENAME} main restricted universe multiverse
 deb http://mirrors.aliyun.com/ubuntu ${UBUNTU_CODENAME}-updates main restricted universe multiverse
@@ -87,9 +94,11 @@ ALIYUN_OK=0
 if [ "$OS" = "alpine" ]; then
     apk update && apk add python3 curl openssl iptables ip6tables coreutils bash tar libc6-compat gcompat iproute2 && ALIYUN_OK=1 || true
 else
-    if apt-get update -y 2>&1 | tee /tmp/kui_apt_update.log; then
+    if apt-get update -y >/tmp/kui_apt_update.log 2>&1; then
+        cat /tmp/kui_apt_update.log
         ALIYUN_OK=1
     else
+        cat /tmp/kui_apt_update.log
         echo "⚠️  aliyun 源 apt-get update 失败，回滚到原 sources.list..."
         if [ -f /etc/apt/sources.list.bak ]; then
             mv /etc/apt/sources.list.bak /etc/apt/sources.list
@@ -111,11 +120,14 @@ case "$ARCH" in
     *) echo "不支持的 CPU 架构: $ARCH"; exit 1 ;;
 esac
 SB_VER="1.13.14"
-curl -sLo sing-box.tar.gz -A "$CURL_USER_AGENT" "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
+SB_SUFFIX="linux-${SB_ARCH}"
+[ "$OS" = "alpine" ] && SB_SUFFIX="linux-${SB_ARCH}-musl"
+curl -fL --retry 3 -o sing-box.tar.gz -A "$CURL_USER_AGENT" "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-${SB_SUFFIX}.tar.gz"
 tar -xzf sing-box.tar.gz
-mv sing-box-${SB_VER}-linux-${SB_ARCH}/sing-box /usr/bin/
+test -x "sing-box-${SB_VER}-${SB_SUFFIX}/sing-box"
+mv "sing-box-${SB_VER}-${SB_SUFFIX}/sing-box" /usr/bin/
 chmod +x /usr/bin/sing-box
-rm -rf sing-box.tar.gz sing-box-${SB_VER}-linux-${SB_ARCH}
+rm -rf sing-box.tar.gz "sing-box-${SB_VER}-${SB_SUFFIX}"
 
 echo "[4.5/6] ⚙️ 正在应用网络内核调优（BBR / QUIC / conntrack）..."
 if [ "$OS" = "alpine" ]; then
@@ -141,15 +153,8 @@ fi
 echo "[5/6] 📂 初始化 KUI 工作目录与环境..."
 mkdir -p /opt/kui /etc/sing-box
 
-cat > /opt/kui/config.json <<EOF
-{
-  "api_url": "${API_URL}/api/config",
-  "report_url": "${API_URL}/api/report",
-  "ip": "${VPS_IP}",
-  "token": "${TOKEN}",
-  "proxy_api": "${PROXY_API_URL}"
-}
-EOF
+API_URL="$API_URL" VPS_IP="$VPS_IP" TOKEN="$TOKEN" PROXY_API_URL="${PROXY_API_URL:-}" python3 -c 'import json, os; json.dump({"api_url": os.environ["API_URL"] + "/api/config", "report_url": os.environ["API_URL"] + "/api/report", "ip": os.environ["VPS_IP"], "token": os.environ["TOKEN"], "proxy_api": os.environ["PROXY_API_URL"]}, open("/opt/kui/config.json", "w"))'
+chmod 600 /opt/kui/config.json
 
 echo "正在拉取最新版 Agent 执行器..."
 AGENT_URL="${API_URL}/vps/agent.py"
@@ -170,7 +175,7 @@ fi
 if ! is_valid_py /opt/kui/agent.py; then
     echo "❌ 下载 agent.py 失败：请确认已在 Cloudflare Pages 部署本仓库（使 /vps/agent.py 可访问），或稍后避开 GitHub 限流再试。"; exit 1;
 fi
-chmod +x /opt/kui/agent.py
+chmod 700 /opt/kui/agent.py
 
 echo "[6/6] 🛡️ 智能注册底层守护进程并启动..."
 if [ "$OS" = "alpine" ]; then

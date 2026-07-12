@@ -14,6 +14,8 @@ AUTH_FILE = WORKSPACE / "auth.txt"
 
 WEB_USER = os.environ.get("WEB_USER", "admin")
 WEB_PASS = os.environ.get("WEB_PASS", "admin888")
+AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "")
+VPS_IP = os.environ.get("VPS_IP", "")
 
 PROXY_PORT = 7920
 target_country = "JP"
@@ -72,6 +74,8 @@ def get_public_ip():
             public_ip = "Unknown_IP"
 
 def get_c2_headers():
+    if AGENT_TOKEN:
+        return {"User-Agent": "KUI-Residential-Agent/2.0", "Authorization": AGENT_TOKEN}
     auth_ptr = base64.b64encode(f"{WEB_USER}:{WEB_PASS}".encode()).decode()
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -91,7 +95,7 @@ def fetch_controller_config():
     导致 VPS 永远无法感知地区变更。
     """
     base = C2_URL.rstrip('/')
-    url = f"{base}{C2_API_PREFIX}/config"
+    url = f"{base}{C2_API_PREFIX}/config?ip={VPS_IP}"
     try:
         req = urllib.request.Request(url, headers=get_c2_headers())
         with urllib.request.urlopen(req, timeout=10) as res:
@@ -180,7 +184,7 @@ def c2_heartbeat_loop():
                         "node_ip": tun.egress_ip if tun.egress_ip else tun.entry_ip
                     })
         
-        payload = json.dumps({"ip": public_ip, "details": details, "logs": get_recent_logs()}).encode('utf-8')
+        payload = json.dumps({"ip": VPS_IP, "socks_ip": public_ip, "details": details, "logs": get_recent_logs()}).encode('utf-8')
         try:
             req = urllib.request.Request(f"{C2_URL}{C2_API_PREFIX}/report", data=payload, headers=get_c2_headers(), method='POST')
             urllib.request.urlopen(req, timeout=10)
@@ -205,16 +209,19 @@ def harvest_snapshot_nodes() -> list:
         if lines and lines[0].startswith("#"): lines[0] = lines[0][1:]
         nodes = []
         for row in csv.DictReader(lines):
-            ip = row.get("IP")
-            if not ip or not row.get("OpenVPN_ConfigData_Base64"): continue
-            raw_ping = row.get("Ping", "")
-            nodes.append({
-                "ip": ip, 
-                "ping": int(raw_ping) if raw_ping.isdigit() else 9999, 
-                "country": row.get("CountryShort", "").upper(), 
-                "config": base64.b64decode(row["OpenVPN_ConfigData_Base64"]).decode("utf-8", errors="replace"),
-                "harvested_at": time.time()
-            })
+            try:
+                ip = row.get("IP")
+                if not ip or not row.get("OpenVPN_ConfigData_Base64"): continue
+                raw_ping = row.get("Ping", "")
+                nodes.append({
+                    "ip": ip,
+                    "ping": int(raw_ping) if raw_ping.isdigit() else 9999,
+                    "country": row.get("CountryShort", "").upper(),
+                    "config": base64.b64decode(row["OpenVPN_ConfigData_Base64"], validate=True).decode("utf-8", errors="replace"),
+                    "harvested_at": time.time()
+                })
+            except Exception:
+                continue
         return nodes
     except Exception as e: return []
 
@@ -391,64 +398,43 @@ def connect_node(tun: Tunnel, node: dict):
                 tun.entry_ip = ""
 
 def health_check_loop():
-    global tun_main, dead_ips
-    fail_count = 0
+    global tun_main, tun_backup, dead_ips
+    fail_counts = {}
     while True:
-        # 如果处于异常容错状态，缩短检测间隔进行快速复核
-        time.sleep(15 if fail_count == 0 else 5)
-        
-        target_tun = ""
-        target_entry_ip = ""
-        proc_ref = None
-        
+        time.sleep(15 if not any(fail_counts.values()) else 5)
+        targets = []
         with state_lock:
-            if tun_main.ready and tun_main.process and tun_main.process.poll() is None:
-                if time.time() - tun_main.connected_at > 20:
-                    target_tun = tun_main.name
-                    target_entry_ip = tun_main.entry_ip
-                    proc_ref = tun_main.process
-        
-        if not target_tun:
-            fail_count = 0
-            continue
-            
-        # 1. 应用层：多维 HTTP 探针 (包含域名与直连IP，规避单点限流和DNS污染)
-        endpoints = [
-            "http://www.gstatic.com/generate_204",
-            "http://cp.cloudflare.com/generate_204",
-            "http://1.1.1.1",
-            "http://8.8.8.8"
-        ]
-        
-        is_alive = False
-        for ep in endpoints:
-            res = subprocess.run(["curl", "-I", "-s", "-m", "5", "--interface", target_tun, ep], capture_output=True)
-            if res.returncode == 0:
-                is_alive = True
-                break
-                
-        # 2. 网络层：如果应用层全挂，尝试底层 ICMP (Ping) 作为终极底线
-        if not is_alive:
-            ping_res = subprocess.run(["ping", "-c", "2", "-W", "3", "-I", target_tun, "8.8.8.8"], capture_output=True)
-            if ping_res.returncode == 0:
-                is_alive = True
-                
-        # 3. 容错评估与处决
-        if not is_alive:
-            fail_count += 1
-            if fail_count >= 3:
-                print(f"[!] {target_tun} 连续 {fail_count} 次多维探针(HTTP/ICMP)均无响应，确认为真死断流，执行踢线: {target_entry_ip}", flush=True)
-                penalize_node(target_entry_ip, 3000) # 运行中死掉的节点给予轻中度惩罚
+            for tunnel in (tun_main, tun_backup):
+                if tunnel.ready and tunnel.process and tunnel.process.poll() is None and time.time() - tunnel.connected_at > 20:
+                    targets.append((tunnel, tunnel.name, tunnel.entry_ip, tunnel.process))
+
+        for tunnel, target_tun, target_entry_ip, proc_ref in targets:
+            is_alive = False
+            for endpoint in ["http://www.gstatic.com/generate_204", "http://cp.cloudflare.com/generate_204", "http://1.1.1.1", "http://8.8.8.8"]:
+                result = subprocess.run(["curl", "-I", "-s", "-m", "5", "--interface", target_tun, endpoint], capture_output=True)
+                if result.returncode == 0:
+                    is_alive = True
+                    break
+            if not is_alive:
+                is_alive = subprocess.run(["ping", "-c", "2", "-W", "3", "-I", target_tun, "8.8.8.8"], capture_output=True).returncode == 0
+
+            process_key = id(proc_ref)
+            if is_alive:
+                fail_counts[process_key] = 0
+                continue
+            fail_counts[process_key] = fail_counts.get(process_key, 0) + 1
+            if fail_counts[process_key] >= 3:
+                print(f"[!] {target_tun} 连续探针无响应，执行踢线: {target_entry_ip}", flush=True)
+                penalize_node(target_entry_ip, 3000)
                 dead_ips.add(target_entry_ip)
                 try: proc_ref.terminate(); proc_ref.wait(timeout=2)
                 except: proc_ref.kill()
                 with state_lock:
-                    if tun_main.process == proc_ref: tun_main.ready = False
-                fail_count = 0
+                    if tunnel.process == proc_ref:
+                        tunnel.ready = False
+                fail_counts.pop(process_key, None)
             else:
-                print(f"[*] {target_tun} 探针无响应，启动快频深度复核容错机制 ({fail_count}/3)...", flush=True)
-        else:
-            fail_count = 0
+                print(f"[*] {target_tun} 探针无响应，快速复核 ({fail_counts[process_key]}/3)...", flush=True)
 
 def get_best_candidate():
     global global_node_reservoir, dead_ips, target_country, tun_main, tun_backup

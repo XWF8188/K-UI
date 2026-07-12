@@ -2,7 +2,7 @@
 from __future__ import annotations
 import os
 import ipaddress
-import select, socket, threading, urllib.parse, time, base64
+import select, socket, threading, urllib.parse, time, base64, hmac
 from typing import Any
 
 _PROXY_USER = os.environ.get("PROXY_USER", "proxy")
@@ -121,7 +121,7 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         plen = recv_exact(client, 1)[0]
         upass = recv_exact(client, plen)
         
-        if uname != PROXY_USER or upass != PROXY_PASS:
+        if not hmac.compare_digest(uname, PROXY_USER) or not hmac.compare_digest(upass, PROXY_PASS):
             client.sendall(b"\x01\x01")
             return
         client.sendall(b"\x01\x00") 
@@ -157,7 +157,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         auth_passed = False
         for line in lines[1:]:
             if line.lower().startswith("proxy-authorization:"):
-                if line.split(":", 1)[1].strip() == expected_auth:
+                if hmac.compare_digest(line.split(":", 1)[1].strip(), expected_auth):
                     auth_passed = True
                     break
                     
@@ -202,27 +202,35 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
 
 def start_proxy_server(host: str, port: int) -> None:
     servers = []
-    try:
-        server6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        server6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-        server6.bind(("::", port))
-        server6.listen(256)
-        servers.append(server6)
-    except Exception as e:
-        pass
+    retry_delay = 1
+    attempts = 0
+    while not servers and attempts < 10:
+        attempts += 1
+        try:
+            server6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            server6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            server6.bind(("::", port))
+            server6.listen(256)
+            servers.append(server6)
+        except Exception as error:
+            print(f"[proxy] IPv6 bind failed on {port}: {error}", flush=True)
 
-    try:
-        server4 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server4.bind(("0.0.0.0", port))
-        server4.listen(256)
-        servers.append(server4)
-    except Exception as e:
-        pass
+        try:
+            server4 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server4.bind(("0.0.0.0", port))
+            server4.listen(256)
+            servers.append(server4)
+        except Exception as error:
+            print(f"[proxy] IPv4 bind failed on {port}: {error}", flush=True)
 
+        if not servers:
+            print(f"[proxy] retrying bind in {retry_delay}s", flush=True)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 30)
     if not servers:
-        return
+        raise OSError(f"unable to bind proxy port {port} after {attempts} attempts")
     while True:
         try:
             readable, _, _ = select.select(servers, [], [], 1.0)

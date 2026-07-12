@@ -8,6 +8,16 @@ async function sha256(text) {
     return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+async function chunkBatch(db, statements, size = 100) {
+    for (let i = 0; i < statements.length; i += size) {
+        await db.batch(statements.slice(i, i + size));
+    }
+}
+
+function yamlString(value) {
+    return `"${String(value ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, '\\n')}"`;
+}
+
 function formatIpForLink(ip) {
     if (!ip || typeof ip !== 'string') return ip;
     if (ip.startsWith('[') && ip.endsWith(']')) return ip;
@@ -252,7 +262,7 @@ async function parseThirdPartySubscription(content) {
                     }
                 }
                 node = {
-                    protocol: 'Socks5', name: '', address: host, port: port, uuid: password, password, sni: host,
+                    protocol: 'SS', name: '', address: host, port: port, uuid: method, password, sni: host,
                     public_key: '', short_id: '', flow: '', network: 'tcp', host: '', path: '', extra: JSON.stringify({method}), enable: 1
                 };
             } else if (rawLC.startsWith('ssr://')) {
@@ -263,7 +273,7 @@ async function parseThirdPartySubscription(content) {
                 if (bpms.length >= 5) {
                     const method = bpms[0], password = base64ToUtf8(bpms[1]), host = bpms[2], port = bpms[3];
                     node = {
-                        protocol: 'Socks5', name: '', address: host, port: parseInt(port) || 8388, uuid: password, password,
+                        protocol: 'SSR', name: '', address: host, port: parseInt(port) || 8388, uuid: method, password,
                         sni: host, public_key: '', short_id: '', flow: '', network: 'tcp', host: '', path: '',
                         extra: JSON.stringify({method, protocol: bpms[4], obfs: bpms[5]}), enable: 1
                     };
@@ -296,7 +306,8 @@ async function ensureDbSchema(db) {
         `CREATE TABLE IF NOT EXISTS sys_config (key TEXT PRIMARY KEY, val TEXT, ts INTEGER)`,
         `CREATE TABLE IF NOT EXISTS proxy_ctrl_servers (ip TEXT PRIMARY KEY, details TEXT, last_seen INTEGER)`,
         `CREATE TABLE IF NOT EXISTS server_logs (ip TEXT PRIMARY KEY, logs TEXT, updated_at INTEGER)`,
-        `CREATE TABLE IF NOT EXISTS proxy_slot_map (key TEXT PRIMARY KEY, value TEXT)`
+        `CREATE TABLE IF NOT EXISTS proxy_slot_map (key TEXT PRIMARY KEY, value TEXT)`,
+        `CREATE TABLE IF NOT EXISTS report_receipts (report_id TEXT PRIMARY KEY, vps_ip TEXT NOT NULL, created_at INTEGER NOT NULL)`
     ];
     for (let query of initQueries) { try { await db.prepare(query).run(); } catch (e) {} }
 
@@ -323,6 +334,7 @@ async function ensureDbSchema(db) {
     try { await db.prepare("SELECT reset_day FROM probe_servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE probe_servers ADD COLUMN reset_day TEXT DEFAULT '1'").run(); } catch(e){} }
     try { await db.prepare("SELECT socks5_enable FROM servers LIMIT 1").first(); } catch (e) { const s5Cols = ['socks5_enable INTEGER DEFAULT 0', 'socks5_addr TEXT DEFAULT ""', 'socks5_port INTEGER DEFAULT 0', 'socks5_user TEXT DEFAULT ""', 'socks5_pass TEXT DEFAULT ""']; for (let col of s5Cols) { try { await db.prepare(`ALTER TABLE servers ADD COLUMN ${col}`).run(); } catch(err){} } }
     try { await db.prepare("SELECT socks5_mode FROM servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE servers ADD COLUMN socks5_mode TEXT DEFAULT 'global'").run(); } catch(err){} try { await db.prepare("ALTER TABLE servers ADD COLUMN socks5_domains TEXT DEFAULT ''").run(); } catch(err){} }
+    try { await db.prepare("SELECT agent_token FROM servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE servers ADD COLUMN agent_token TEXT").run(); } catch(err){} }
 
     // 初始化云端测速数据
     const checkNodes = await db.prepare("SELECT value FROM probe_settings WHERE key = 'cached_nodes_data'").first();
@@ -344,23 +356,44 @@ async function ensureDbSchema(db) {
 }
 
 async function verifyAuth(authHeader, db, env) {
-    if (!authHeader) return null;
-    const adminUser = env.ADMIN_USERNAME || "admin";
-    const adminPass = env.ADMIN_PASSWORD || "admin";
-    if (authHeader === adminPass || authHeader === await sha256(adminPass)) return adminUser;
-    const parts = authHeader.split('.');
-    if (parts.length !== 3) return null;
-    const [b64User, timestamp, clientSig] = parts;
-    if (Math.abs(Date.now() - parseInt(timestamp)) > 300000) return null; 
-    const username = atob(b64User);
-    let baseKeyHex;
-    if (username === adminUser) { baseKeyHex = await sha256(adminPass); } 
-    else { const u = await db.prepare("SELECT password FROM users WHERE username = ?").bind(username).first(); if (!u) return null; baseKeyHex = u.password; }
-    const keyBytes = new Uint8Array(baseKeyHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-    const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-    const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(username + timestamp));
-    const expectedSig = Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('');
-    return clientSig === expectedSig ? username : null;
+    try {
+        if (!authHeader) return null;
+        const adminUser = env.ADMIN_USERNAME || "admin";
+        const adminPass = env.ADMIN_PASSWORD || "admin";
+        const parts = authHeader.split('.');
+        if (parts.length !== 3) return null;
+        const [b64User, timestamp, clientSig] = parts;
+        const timestampNumber = Number(timestamp);
+        if (!Number.isFinite(timestampNumber) || Math.abs(Date.now() - timestampNumber) > 300000) return null;
+        const username = atob(b64User);
+        let baseKeyHex;
+        if (username === adminUser) baseKeyHex = await sha256(adminPass);
+        else {
+            const user = await db.prepare("SELECT password FROM users WHERE username = ?").bind(username).first();
+            if (!user || !/^[0-9a-f]{64}$/i.test(user.password || '')) return null;
+            baseKeyHex = user.password;
+        }
+        const keyBytes = new Uint8Array(baseKeyHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+        const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(username + timestamp));
+        const expectedSig = Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('');
+        return clientSig === expectedSig ? username : null;
+    } catch (error) {
+        return null;
+    }
+}
+
+async function verifyAgent(authHeader, ip, db, env) {
+    if (!authHeader) return false;
+    if (ip) {
+        const server = await db.prepare("SELECT agent_token FROM servers WHERE ip = ?").bind(ip).first();
+        if (server && server.agent_token && authHeader === server.agent_token) return true;
+    }
+    if (env.LEGACY_AGENT_AUTH === 'true' && ip) {
+        const server = await db.prepare("SELECT agent_token FROM servers WHERE ip = ?").bind(ip).first();
+        if (server && !server.agent_token) return authHeader === await sha256(env.ADMIN_PASSWORD || "admin");
+    }
+    return false;
 }
 
 // ==============================================
@@ -375,6 +408,8 @@ async function handleProbeAPI(request, env, context, pathArray) {
     // Telegram Bot 交互回调控制
     if (method === 'POST' && subPath === 'tg_webhook') {
         try {
+            const webhookSecret = env.TG_WEBHOOK_SECRET || '';
+            if (webhookSecret && request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== webhookSecret) return new Response('OK', { status: 200 });
             const body = await request.json();
             const message = body.message; const callback_query = body.callback_query;
             let tgBotToken = ''; let tgChatId = '';
@@ -447,6 +482,8 @@ async function handleProbeAPI(request, env, context, pathArray) {
         if (settings.is_public !== 'true' && !isLoggedIn) return Response.json({ error: "Private Dashboard" }, { status: 401 });
 
         const servers = (await db.prepare('SELECT id, name, cpu, ram, disk, load_avg, uptime, last_updated, net_in_speed, net_out_speed, os, arch, virt, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, net_rx, net_tx, cpu_info, ram_used, ram_total, disk_used, disk_total FROM probe_servers WHERE is_hidden != "true"').all()).results;
+        const publicKeys = new Set(['theme', 'is_public', 'site_title', 'show_price', 'show_expire', 'show_bw', 'show_tf', 'custom_css', 'custom_bg', 'custom_head', 'custom_script', 'report_interval', 'enable_popup', 'popup_content', 'cached_nodes_data', 'auto_reset_traffic', 'visits_total', 'visits_today', 'visits_date']);
+        for (const key of Object.keys(settings)) if (!publicKeys.has(key)) delete settings[key];
         return Response.json({ settings, servers });
     }
 
@@ -454,6 +491,8 @@ async function handleProbeAPI(request, env, context, pathArray) {
         const id = url.searchParams.get('id');
         const server = await db.prepare('SELECT * FROM probe_servers WHERE id = ?').bind(id).first();
         if (!server || server.is_hidden === 'true') return Response.json({ error: "Not found" }, { status: 404 });
+        const publicSetting = await db.prepare("SELECT value FROM probe_settings WHERE key = 'is_public'").first();
+        if (publicSetting && publicSetting.value !== 'true' && !(await verifyAuth(request.headers.get('Authorization'), db, env))) return Response.json({ error: "Unauthorized" }, { status: 401 });
         return Response.json(server);
     }
 
@@ -486,7 +525,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
             try {
                await fetch(`https://api.telegram.org/bot${settings.tg_bot_token}/setWebhook`, {
                   method: 'POST', headers: {'Content-Type': 'application/json'},
-                  body: JSON.stringify({ url: `${url.origin}/api/probe/tg_webhook` })
+                   body: JSON.stringify({ url: `${url.origin}/api/probe/tg_webhook`, ...(env.TG_WEBHOOK_SECRET ? { secret_token: env.TG_WEBHOOK_SECRET } : {}) })
                });
             } catch(e) {}
         }
@@ -569,6 +608,8 @@ async function proxyLocal(method, subPath, req, env) {
                 const data = await req.json();
                 const rawCountry = (data["0"] || data.country || "JP").toString().toUpperCase().trim();
                 const sanitized = { "0": rawCountry, "country": rawCountry, "port": parseInt(data.port) || 7920 };
+                if (data.enabled !== undefined) sanitized.enabled = !!data.enabled;
+                if (data.mesh && typeof data.mesh === 'object') sanitized.mesh = data.mesh;
                 if (data.switch_trigger) sanitized.switch_trigger = data.switch_trigger;
                 console.log('[proxy-config-save] writing to probe_settings:', JSON.stringify(sanitized));
                 await db.prepare("INSERT INTO probe_settings (key, value) VALUES ('proxy_slot_map', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(JSON.stringify(sanitized)).run();
@@ -582,13 +623,14 @@ async function proxyLocal(method, subPath, req, env) {
     if (subPath === 'report' && method === 'POST') {
         try {
             const data = await req.json();
+            const proxyIp = data.socks_ip || data.ip;
             if (data.details !== undefined) {
-                await db.prepare(`INSERT INTO proxy_ctrl_servers (ip, details, last_seen) VALUES (?1, ?2, ?3) ON CONFLICT(ip) DO UPDATE SET details = excluded.details, last_seen = excluded.last_seen`).bind(data.ip, JSON.stringify(data.details), Date.now()).run();
+                await db.prepare(`INSERT INTO proxy_ctrl_servers (ip, details, last_seen) VALUES (?1, ?2, ?3) ON CONFLICT(ip) DO UPDATE SET details = excluded.details, last_seen = excluded.last_seen`).bind(proxyIp, JSON.stringify(data.details), Date.now()).run();
             } else {
-                await db.prepare(`INSERT INTO proxy_ctrl_servers (ip, last_seen) VALUES (?1, ?2) ON CONFLICT(ip) DO UPDATE SET last_seen = excluded.last_seen`).bind(data.ip, Date.now()).run();
+                await db.prepare(`INSERT INTO proxy_ctrl_servers (ip, last_seen) VALUES (?1, ?2) ON CONFLICT(ip) DO UPDATE SET last_seen = excluded.last_seen`).bind(proxyIp, Date.now()).run();
             }
             if (data.logs) {
-                await db.prepare(`INSERT INTO server_logs (ip, logs, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(ip) DO UPDATE SET logs = excluded.logs, updated_at = excluded.updated_at`).bind(data.ip, data.logs, Date.now()).run();
+                await db.prepare(`INSERT INTO server_logs (ip, logs, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(ip) DO UPDATE SET logs = excluded.logs, updated_at = excluded.updated_at`).bind(proxyIp, data.logs, Date.now()).run();
             }
             return new Response("OK", { status: 200 });
         } catch (e) { return new Response("Error", { status: 500 }); }
@@ -680,11 +722,16 @@ export async function onRequest(context) {
     // 🌟 Agent 统一探针与管理上报接口 (融入全新的 Reset Day 计算和动态云端测速节点)
     if (action === "report" && method === "POST") {
      try {
-        if (!(await verifyAuth(request.headers.get("Authorization"), db, env))) return new Response("Unauthorized", { status: 401 });
         await ensureDbSchema(db);
         const data = await request.json(); 
         const nowMs = Date.now();
         const vpsIp = data.ip;
+        if (!(await verifyAgent(request.headers.get("Authorization"), vpsIp, db, env))) return new Response("Unauthorized", { status: 401 });
+        let duplicateReport = false;
+        if (data.report_id) {
+            const receipt = await db.prepare("INSERT OR IGNORE INTO report_receipts (report_id, vps_ip, created_at) VALUES (?, ?, ?)").bind(data.report_id, vpsIp, nowMs).run();
+            duplicateReport = !receipt.meta || receipt.meta.changes === 0;
+        }
 
         const kuiServer = await db.prepare('SELECT name FROM servers WHERE ip = ?').bind(vpsIp).first();
         if (!kuiServer) {
@@ -749,9 +796,11 @@ export async function onRequest(context) {
             }
 
             const current_rx = parseFloat(data.net_rx || '0'); const current_tx = parseFloat(data.net_tx || '0');
-            if (current_rx >= last_rx) monthly_rx += (current_rx - last_rx); else monthly_rx += current_rx;
-            if (current_tx >= last_tx) monthly_tx += (current_tx - last_tx); else monthly_tx += current_tx;
-            last_rx = current_rx; last_tx = current_tx;
+            if (!duplicateReport) {
+                if (current_rx >= last_rx) monthly_rx += (current_rx - last_rx); else monthly_rx += current_rx;
+                if (current_tx >= last_tx) monthly_tx += (current_tx - last_tx); else monthly_tx += current_tx;
+                last_rx = current_rx; last_tx = current_tx;
+            }
 
             const lastHistTime = history.last_time || 0;
             if (nowMs - lastHistTime >= 300000 || !history.time) {
@@ -771,7 +820,7 @@ export async function onRequest(context) {
         } catch (e) { console.error("探针数据同步失败:", e); }
 
         const stmts = []; let totalDelta = 0;
-        if (data.node_traffic && data.node_traffic.length > 0) { 
+        if (!duplicateReport && data.node_traffic && data.node_traffic.length > 0) {
             for (let nt of data.node_traffic) { 
                 stmts.push(db.prepare("UPDATE nodes SET traffic_used = traffic_used + ? WHERE id = ?").bind(nt.delta_bytes, nt.id)); 
                 stmts.push(db.prepare(`UPDATE users SET traffic_used = traffic_used + ? WHERE username = (SELECT username FROM nodes WHERE id = ?)`).bind(nt.delta_bytes, nt.id)); 
@@ -779,8 +828,15 @@ export async function onRequest(context) {
             } 
         }
         if (data.argo_urls && data.argo_urls.length > 0) { for (let argo of data.argo_urls) { stmts.push(db.prepare("UPDATE nodes SET sni = ? WHERE id = ? AND protocol = 'VLESS-Argo' AND sni != ?").bind(argo.url, argo.id, argo.url)); } }
-        if (totalDelta > 0) { stmts.push(db.prepare("INSERT INTO traffic_stats (ip, delta_bytes, timestamp) VALUES (?, ?, ?)").bind(vpsIp, totalDelta, nowMs)); }
-        if (stmts.length > 0) await db.batch(stmts);
+        if (!duplicateReport && totalDelta > 0) { stmts.push(db.prepare("INSERT INTO traffic_stats (ip, delta_bytes, timestamp) VALUES (?, ?, ?)").bind(vpsIp, totalDelta, nowMs)); }
+        if (stmts.length > 0) {
+            try { await chunkBatch(db, stmts); }
+            catch (error) {
+                if (data.report_id && !duplicateReport) await db.prepare("DELETE FROM report_receipts WHERE report_id = ?").bind(data.report_id).run().catch(() => {});
+                throw error;
+            }
+        }
+        context.waitUntil(db.prepare("DELETE FROM report_receipts WHERE created_at < ?").bind(nowMs - 604800000).run().catch(() => {}));
         
         let fastMode = false; try { const uiActive = await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first(); if (uiActive && (nowMs - uiActive.ts < 20000)) fastMode = true; } catch(e) {}
         
@@ -804,11 +860,13 @@ export async function onRequest(context) {
     }
 
     if (action === "config" && method === "GET") {
-        if (!(await verifyAuth(request.headers.get("Authorization"), db, env))) return new Response("Unauthorized", { status: 401 });
         const ip = new URL(request.url).searchParams.get("ip"); const now = Date.now(); const adminUser = env.ADMIN_USERNAME || "admin";
+        const authHeader = request.headers.get("Authorization");
+        const currentUser = await verifyAuth(authHeader, db, env);
+        if (currentUser !== adminUser && !(await verifyAgent(authHeader, ip, db, env))) return new Response("Unauthorized", { status: 401 });
         const query = `SELECT n.* FROM nodes n LEFT JOIN users u ON n.username = u.username WHERE n.vps_ip = ? AND n.enable = 1 AND (n.traffic_limit = 0 OR n.traffic_used < n.traffic_limit) AND (n.expire_time = 0 OR n.expire_time > ?) AND (n.username = ? OR n.username = 'admin' OR (u.username IS NOT NULL AND u.enable = 1 AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) AND (u.expire_time = 0 OR u.expire_time > ?)))`;
         const { results: machineNodes } = await db.prepare(query).bind(ip, now, adminUser, now).all();
-        for (let node of machineNodes) { if (node.protocol === "dokodemo-door" && node.relay_type === "internal") { const targetNode = await db.prepare("SELECT * FROM nodes WHERE id = ?").bind(node.target_id).first(); if (targetNode) node.chain_target = { ip: targetNode.vps_ip, port: targetNode.port, protocol: targetNode.protocol, uuid: targetNode.uuid, sni: targetNode.sni, public_key: targetNode.public_key, short_id: targetNode.short_id }; } }
+        for (let node of machineNodes) { if (node.protocol === "dokodemo-door" && node.relay_type === "internal") { const targetNode = await db.prepare("SELECT * FROM nodes WHERE id = ?").bind(node.target_id).first(); if (targetNode) node.chain_target = { ip: targetNode.vps_ip, port: targetNode.port, protocol: targetNode.protocol, uuid: targetNode.uuid, password: targetNode.private_key, sni: targetNode.sni, public_key: targetNode.public_key, short_id: targetNode.short_id }; } }
         let proxyCfg = { global: {}, toggle: { enable: false } };
         try {
             const r = await db.prepare("SELECT value FROM probe_settings WHERE key='proxy_config'").first();
@@ -829,6 +887,16 @@ export async function onRequest(context) {
         const sub = params.path && params.path.length > 1 ? params.path.slice(1).join('/') : '';
         if (sub === "mesh" || sub.startsWith("mesh/")) {
             return new Response(JSON.stringify({ error: "mesh is not supported" }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (sub === 'report' && method === 'POST') {
+            const body = await request.clone().json().catch(() => ({}));
+            if (!(await verifyAgent(request.headers.get('Authorization'), body.ip, db, env))) return new Response('Unauthorized', { status: 401 });
+        } else if ((sub === 'config' && method === 'GET') || (sub === 'proxies' && method === 'GET')) {
+            const requestIp = new URL(request.url).searchParams.get('ip');
+            const user = await verifyAuth(request.headers.get('Authorization'), db, env);
+            if (!user && !(await verifyAgent(request.headers.get('Authorization'), requestIp, db, env))) return new Response('Unauthorized', { status: 401 });
+        } else if (!(await verifyAuth(request.headers.get('Authorization'), db, env))) {
+            return new Response('Unauthorized', { status: 401 });
         }
         return await proxyBridge(method, sub, request, env);
     }
@@ -905,28 +973,28 @@ export async function onRequest(context) {
                 if (node.protocol.includes("VLESS") || node.protocol.includes("Reality")) {
                     const serverIpOrSni = (node.protocol === 'VLESS-Argo' && !(node.sni || '').includes('等待')) ? node.sni : nodeIp;
                     const serverPort = node.protocol === 'VLESS-Argo' ? 443 : node.port;
-                    cProxy = `  - name: "${rawRemark}"\n    type: vless\n    server: ${serverIpOrSni}\n    port: ${serverPort}\n    uuid: ${node.uuid}\n    udp: true`;
+                    cProxy = `  - name: ${yamlString(rawRemark)}\n    type: vless\n    server: ${yamlString(serverIpOrSni)}\n    port: ${serverPort}\n    uuid: ${yamlString(node.uuid)}\n    udp: true`;
                     
                     if (node.protocol === "XTLS-Reality" || node.protocol === "Reality") {
-                        cProxy += `\n    tls: true\n    flow: xtls-rprx-vision\n    servername: ${nodeSni}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${node.public_key}\n      short-id: ${node.short_id || ""}`;
+                        cProxy += `\n    tls: true\n    flow: xtls-rprx-vision\n    servername: ${yamlString(nodeSni)}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${yamlString(node.public_key)}\n      short-id: ${yamlString(node.short_id || "")}`;
                     } else if (node.protocol === "gRPC-Reality") {
-                        cProxy += `\n    tls: true\n    servername: ${nodeSni}\n    client-fingerprint: chrome\n    network: grpc\n    grpc-opts:\n      grpc-service-name: grpc\n    reality-opts:\n      public-key: ${node.public_key}\n      short-id: ${node.short_id || ""}`;
+                        cProxy += `\n    tls: true\n    servername: ${yamlString(nodeSni)}\n    client-fingerprint: chrome\n    network: grpc\n    grpc-opts:\n      grpc-service-name: grpc\n    reality-opts:\n      public-key: ${yamlString(node.public_key)}\n      short-id: ${yamlString(node.short_id || "")}`;
                     } else if (node.protocol === "H2-Reality") {
-                        cProxy += `\n    tls: true\n    servername: ${nodeSni}\n    client-fingerprint: chrome\n    network: h2\n    h2-opts:\n      host:\n        - ${nodeSni || nodeIp}\n      path: "/"`;
+                        cProxy += `\n    tls: true\n    servername: ${yamlString(nodeSni)}\n    client-fingerprint: chrome\n    network: h2\n    h2-opts:\n      host:\n        - ${yamlString(nodeSni || nodeIp)}\n      path: "/"`;
                     } else if (node.protocol === 'VLESS-Argo' && !(node.sni || '').includes('等待')) {
-                        cProxy += `\n    tls: true\n    servername: ${nodeSni}\n    network: ws\n    ws-opts:\n      path: "/"\n      headers:\n        Host: ${nodeSni}`;
+                        cProxy += `\n    tls: true\n    servername: ${yamlString(nodeSni)}\n    network: ws\n    ws-opts:\n      path: "/"\n      headers:\n        Host: ${yamlString(nodeSni)}`;
                     }
                 } else if (node.protocol === "Trojan") {
-                    cProxy = `  - name: "${rawRemark}"\n    type: trojan\n    server: ${nodeIp}\n    port: ${node.port}\n    password: ${node.private_key}\n    udp: true\n    sni: ${nodeSni}\n    skip-cert-verify: true`;
+                    cProxy = `  - name: ${yamlString(rawRemark)}\n    type: trojan\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    password: ${yamlString(node.private_key)}\n    udp: true\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
                 } else if (node.protocol === "Hysteria2") {
-                    cProxy = `  - name: "${rawRemark}"\n    type: hysteria2\n    server: ${nodeIp}\n    port: ${node.port}\n    password: ${node.uuid || node.private_key}\n    sni: ${nodeSni}\n    skip-cert-verify: true`;
+                    cProxy = `  - name: ${yamlString(rawRemark)}\n    type: hysteria2\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    password: ${yamlString(node.uuid || node.private_key)}\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
                 } else if (node.protocol === "TUIC") {
-                    cProxy = `  - name: "${rawRemark}"\n    type: tuic\n    server: ${nodeIp}\n    port: ${node.port}\n    uuid: ${node.uuid}\n    password: ${node.private_key}\n    sni: ${nodeSni}\n    skip-cert-verify: true`;
+                    cProxy = `  - name: ${yamlString(rawRemark)}\n    type: tuic\n    server: ${yamlString(nodeIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    password: ${yamlString(node.private_key)}\n    sni: ${yamlString(nodeSni)}\n    skip-cert-verify: true`;
                 }
                 
                 if (cProxy) {
                     clashProxies.push(cProxy);
-                    proxyNames.push(`"${rawRemark}"`);
+                    proxyNames.push(yamlString(rawRemark));
                 }
             }
         }
@@ -959,16 +1027,22 @@ export async function onRequest(context) {
                     case "AnyTLS": link = `anytls://${node.password}@${thirdIp}:${node.port}?security=tls&sni=${thirdSni}&insecure=1#${remark}`; break;
                     case "Naive": link = `naive+https://${node.uuid}:${node.password}@${thirdIp}:${node.port}?security=tls&sni=${thirdSni}#${remark}`; break;
                     case "Socks5": link = `socks5://${btoa(`${node.uuid}:${node.password}`)}@${thirdIp}:${node.port}#${remark}`; break;
+                    case "SS": {
+                        const method = node.uuid || (() => { try { return JSON.parse(node.extra || '{}').method; } catch(e) { return ''; } })();
+                        link = `ss://${btoa(`${method}:${node.password}`)}@${thirdIp}:${node.port}#${remark}`;
+                        break;
+                    }
+                    case "SSR": link = `ssr://${btoa(unescape(encodeURIComponent(`${thirdIp}:${node.port}:origin:${node.uuid}:plain:${btoa(node.password || '')}/?remarks=${btoa(unescape(encodeURIComponent(node.name || 'SSR')))}`)))}`; break;
                 }
                 if (link) subLinks.push(link);
 
                 if (format === 'clash') {
                     let cProxy = "";
                     if (node.protocol === "VMess") {
-                        cProxy = `  - name: "${node.name || 'TP'}"\n    type: vmess\n    server: ${thirdIp}\n    port: ${node.port}\n    uuid: ${node.uuid}\n    alterId: 0\n    cipher: auto\n    udp: true${node.network && node.network !== 'tcp' ? `\n    network: ${node.network}${node.host ? `\n    ws-headers:\n      Host: ${node.host}` : ''}${node.path ? `\n    ws-path: ${node.path}` : ''}` : ''}`;
+                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: vmess\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    alterId: 0\n    cipher: auto\n    udp: true${node.network && node.network !== 'tcp' ? `\n    network: ${yamlString(node.network)}${node.host ? `\n    ws-headers:\n      Host: ${yamlString(node.host)}` : ''}${node.path ? `\n    ws-path: ${yamlString(node.path)}` : ''}` : ''}`;
                     } else if (node.protocol.includes("VLESS") || node.protocol.includes("Reality")) {
                         const isReality = (node.flow && node.flow.includes('rprx')) || node.protocol === "XTLS-Reality" || node.protocol === "Reality";
-                        cProxy = `  - name: "${node.name || 'TP'}"\n    type: vless\n    server: ${thirdIp}\n    port: ${node.port}\n    uuid: ${node.uuid}\n    udp: true`;
+                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: vless\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    udp: true`;
                         if (isReality) {
                             cProxy += `\n    tls: true\n    servername: ${thirdSni}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${node.public_key || ''}\n      short-id: ${node.short_id || ""}`;
                             if (((node.protocol === "Reality" || node.protocol === "XTLS-Reality") && node.flow && node.flow.includes('rprx')) || node.protocol === "VLESS") {
@@ -992,15 +1066,17 @@ export async function onRequest(context) {
                              cProxy += `\n    tls: true\n    servername: ${thirdSni}\n    client-fingerprint: chrome\n    network: h2\n    h2-opts:\n      host:\n        - ${thirdSni || thirdIp}\n      path: "/"`;
                         }
                     } else if (node.protocol === "Trojan") {
-                        cProxy = `  - name: "${node.name || 'TP'}"\n    type: trojan\n    server: ${thirdIp}\n    port: ${node.port}\n    password: ${node.password}\n    udp: true\n    sni: ${thirdSni}\n    skip-cert-verify: true`;
+                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: trojan\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    password: ${yamlString(node.password)}\n    udp: true\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
                     } else if (node.protocol === "Hysteria2") {
-                        cProxy = `  - name: "${node.name || 'TP'}"\n    type: hysteria2\n    server: ${thirdIp}\n    port: ${node.port}\n    password: ${node.uuid || node.password}\n    sni: ${thirdSni}\n    skip-cert-verify: true`;
+                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: hysteria2\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    password: ${yamlString(node.uuid || node.password)}\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
                     } else if (node.protocol === "TUIC") {
-                        cProxy = `  - name: "${node.name || 'TP'}"\n    type: tuic\n    server: ${thirdIp}\n    port: ${node.port}\n    uuid: ${node.uuid}\n    password: ${node.password}\n    sni: ${thirdSni}\n    skip-cert-verify: true`;
+                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: tuic\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    uuid: ${yamlString(node.uuid)}\n    password: ${yamlString(node.password)}\n    sni: ${yamlString(thirdSni)}\n    skip-cert-verify: true`;
+                    } else if (node.protocol === "SS") {
+                        cProxy = `  - name: ${yamlString(node.name || 'TP')}\n    type: ss\n    server: ${yamlString(thirdIp)}\n    port: ${node.port}\n    cipher: ${yamlString(node.uuid)}\n    password: ${yamlString(node.password)}`;
                     }
                     if (cProxy) {
                         clashProxies.push(cProxy);
-                        proxyNames.push(`"${node.name || 'TP'}"`);
+                        proxyNames.push(yamlString(node.name || 'TP'));
                     }
                 }
                 } catch(e) {}
@@ -1025,9 +1101,9 @@ export async function onRequest(context) {
                         const link = `socks5://${proxyUser}:${proxyPass}@${proxyIp}:${node.port || 7920}#${encRemark}`;
                         subLinks.push(link);
                         if (format === 'clash') {
-                            const cProxy = `  - name: "${remark}"\n    type: socks5\n    server: ${proxyIp}\n    port: ${node.port || 7920}\n    username: ${proxyUser}\n    password: ${proxyPass}\n    udp: true`;
+                            const cProxy = `  - name: ${yamlString(remark)}\n    type: socks5\n    server: ${yamlString(proxyIp)}\n    port: ${node.port || 7920}\n    username: ${yamlString(proxyUser)}\n    password: ${yamlString(proxyPass)}\n    udp: true`;
                             clashProxies.push(cProxy);
-                            proxyNames.push(`"${remark}"`);
+                            proxyNames.push(yamlString(remark));
                         }
                     }
                 }
@@ -1089,7 +1165,17 @@ rules:
 
     try {
         if (action === "data") {
-            const servers = (await db.prepare("SELECT * FROM servers").all()).results;
+            const servers = isAdmin
+                ? (await db.prepare("SELECT * FROM servers").all()).results
+                : (await db.prepare("SELECT ip, name, cpu, mem, last_report, disk, load, uptime, net_in_speed, net_out_speed, tcp_conn, udp_conn FROM servers").all()).results;
+            if (isAdmin) {
+                for (const server of servers) {
+                    if (!server.agent_token) {
+                        server.agent_token = crypto.randomUUID();
+                        await db.prepare("UPDATE servers SET agent_token = ? WHERE ip = ? AND agent_token IS NULL").bind(server.agent_token, server.ip).run();
+                    }
+                }
+            }
             const nodes = isAdmin ? (await db.prepare("SELECT * FROM nodes").all()).results : (await db.prepare("SELECT * FROM nodes WHERE username = ?").bind(currentUser).all()).results;
             const users = isAdmin ? (await db.prepare("SELECT * FROM users").all()).results : (await db.prepare("SELECT * FROM users WHERE username = ?").bind(currentUser).all()).results;
             let siteTitle = "Cluster Gateway"; try { const r = await db.prepare("SELECT val FROM sys_config WHERE key='site_title'").first(); if(r && r.val) siteTitle = r.val; } catch(e){}
@@ -1111,7 +1197,7 @@ rules:
         }
         
         if (action === "vps" && isAdmin) {
-            if (method === "POST") { const { ip, name, socks5_enable, socks5_addr, socks5_port, socks5_user, socks5_pass } = await request.json(); await db.prepare("INSERT OR IGNORE INTO servers (ip, name, alert_sent, socks5_enable, socks5_addr, socks5_port, socks5_user, socks5_pass) VALUES (?, ?, 0, ?, ?, ?, ?, ?)").bind(ip, name, socks5_enable||0, socks5_addr||'', socks5_port||0, socks5_user||'', socks5_pass||'').run(); return Response.json({ success: true }); }
+            if (method === "POST") { const { ip, name, socks5_enable, socks5_addr, socks5_port, socks5_user, socks5_pass } = await request.json(); const agentToken = crypto.randomUUID(); await db.prepare("INSERT OR IGNORE INTO servers (ip, name, alert_sent, socks5_enable, socks5_addr, socks5_port, socks5_user, socks5_pass, agent_token) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)").bind(ip, name, socks5_enable||0, socks5_addr||'', socks5_port||0, socks5_user||'', socks5_pass||'', agentToken).run(); await db.prepare("UPDATE servers SET agent_token = COALESCE(agent_token, ?) WHERE ip = ?").bind(agentToken, ip).run(); return Response.json({ success: true }); }
             if (method === "PUT") { const data = await request.json(); const ip = data.ip; if (!ip) return Response.json({ error: "IP required" }, { status: 400 }); const updates = []; const params = []; if (data.socks5_enable !== undefined) { updates.push("socks5_enable = ?"); params.push(data.socks5_enable ? 1 : 0); } if (data.socks5_addr !== undefined) { updates.push("socks5_addr = ?"); params.push(data.socks5_addr); } if (data.socks5_port !== undefined) { updates.push("socks5_port = ?"); params.push(parseInt(data.socks5_port) || 0); } if (data.socks5_user !== undefined) { updates.push("socks5_user = ?"); params.push(data.socks5_user); } if (data.socks5_pass !== undefined) { updates.push("socks5_pass = ?"); params.push(data.socks5_pass); } if (data.socks5_mode !== undefined) { updates.push("socks5_mode = ?"); params.push(data.socks5_mode); } if (data.socks5_domains !== undefined) { updates.push("socks5_domains = ?"); params.push(data.socks5_domains); } if (updates.length > 0) { params.push(ip); await db.prepare(`UPDATE servers SET ${updates.join(', ')} WHERE ip = ?`).bind(...params).run(); } return Response.json({ success: true }); }
             if (method === "DELETE") { 
                 const ip = new URL(request.url).searchParams.get("ip"); 
@@ -1143,7 +1229,7 @@ rules:
                     parseDebug = { protocolCounts, debug };
                     if (nodes.length > 0) {
                         const stmts = nodes.map(n => db.prepare("INSERT INTO third_party_nodes (id, subscription_id, name, protocol, address, port, uuid, password, sni, public_key, short_id, flow, network, host, path, extra, enable, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(n.id, id, n.name, n.protocol, n.address, n.port, n.uuid || '', n.password || '', n.sni || '', n.public_key || '', n.short_id || '', n.flow || '', n.network || '', n.host || '', n.path || '', n.extra || '', 1, now));
-                        await db.batch(stmts);
+                        await chunkBatch(db, stmts);
                         parsedCount = nodes.length;
                     }
                 } catch (e) { console.error("解析第三方订阅失败:", e); parseDebug.fetchError = (e && e.message) || String(e); }
@@ -1190,7 +1276,7 @@ export async function onRequestScheduled(context) {
                 if (tgBotToken && tgChatId) { const text = `⚠️ [KUI 节点失联告警]\n\n节点别名: ${vps.name}\n公网IP: ${vps.ip}\n最后在线: ${new Date(vps.last_report).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`; await fetch(`https://api.telegram.org/bot${tgBotToken}/sendMessage`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: tgChatId, text }) }); }
                 updateStmts.push(db.prepare("UPDATE servers SET alert_sent = 1 WHERE ip = ?").bind(vps.ip));
             }
-            if (updateStmts.length > 0) await db.batch(updateStmts);
+            if (updateStmts.length > 0) await chunkBatch(db, updateStmts);
         }
     } catch (error) {}
 }
