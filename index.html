@@ -567,7 +567,7 @@
                             <h1 class="text-4xl font-extrabold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 via-indigo-400 to-purple-400 tracking-tight drop-shadow-sm">Proxy Controller</h1>
                             <p class="text-slate-400 mt-2 text-sm flex items-center gap-2">
                                 <svg class="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
-                                鉴权提取 API: <a href="/api/proxy/proxies" target="_blank" class="text-indigo-400 hover:text-indigo-300 border-b border-indigo-400/30 hover:border-indigo-300 transition-colors">/api/proxy/proxies</a>
+                                 鉴权提取 API: <a href="javascript:void(0)" @click="fetchApi('/api/proxy/proxies').then(r=>r.text()).then(t=>{const w=window.open('','_blank');w.document.write('<pre>'+t+'</pre>')})" class="text-indigo-400 hover:text-indigo-300 border-b border-indigo-400/30 hover:border-indigo-300 transition-colors cursor-pointer">/api/proxy/proxies</a>
                             </p>
                         </div>
 

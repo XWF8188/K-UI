@@ -35,6 +35,9 @@ def env_secret(name, default=""):
 WEB_USER = env_secret("WEB_USER", "admin")
 WEB_PASS = env_secret("WEB_PASS")
 AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "")
+if not AGENT_TOKEN:
+    try: AGENT_TOKEN = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kui", "config.json"))).get("token", "")
+    except Exception: pass
 VPS_IP = os.environ.get("VPS_IP", "")
 
 PROXY_PORT = 7920
