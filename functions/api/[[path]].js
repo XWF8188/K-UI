@@ -734,7 +734,7 @@ async function proxyLocal(method, subPath, req, env) {
     }
 
     if (subPath === 'pool' && method === 'GET') {
-        const cutoff = Date.now() - 360000;
+        const cutoff = Date.now() - 1800000;
         const { results } = await db.prepare('SELECT ip, details, last_seen FROM proxy_ctrl_servers WHERE last_seen >= ? ORDER BY last_seen DESC').bind(cutoff).all();
         return Response.json(results || []);
     }
@@ -770,7 +770,7 @@ async function proxyLocal(method, subPath, req, env) {
     }
 
     if (subPath === 'proxies' && method === 'GET') {
-        const cutoff = Date.now() - 360000;
+        const cutoff = Date.now() - 1800000;
         const { results } = await db.prepare('SELECT ip, details FROM proxy_ctrl_servers WHERE last_seen >= ?').bind(cutoff).all();
         const list = [];
         if (results) {
@@ -778,6 +778,7 @@ async function proxyLocal(method, subPath, req, env) {
                 const details = JSON.parse(s.details || '[]');
                 const node = details.find(d => d.active) || details[0];
                 if (node) list.push(`socks5://${proxyUser}:${proxyPass}@${s.ip}:${node.port}#${node.country}_ActiveNode_${node.node_ip || 'IP'}`);
+                else list.push(`socks5://${proxyUser}:${proxyPass}@${s.ip}:7920#Connecting_${s.ip}`);
             }
         }
         return new Response(list.join('\n'), { headers: { 'Content-Type': 'text/plain;charset=UTF-8' } });
