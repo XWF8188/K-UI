@@ -221,7 +221,6 @@ Settings → Environment variables → Production
 | `ADMIN_PASSWORD` | Secret | 管理员强密码，至少 16 位 |
 | `PROXY_USER` | Secret | 住宅代理用户名 |
 | `PROXY_PASS` | Secret | 住宅代理密码 |
-| `SUBSCRIPTION_HOST_ALLOWLIST` | Variable | 可选。第三方订阅导入允许的 HTTPS 域名，使用英文逗号分隔 |
 
 第一次部署可以暂时不添加：
 
@@ -633,7 +632,7 @@ VPS 组件每小时通过 Pages 鉴权端点检查更新，验证组件名、长
 
 - `ADMIN_PASSWORD`、`PROXY_USER`、`PROXY_PASS` 使用 Secret。
 - 不要公开 Agent Token、Cloudflare API Token 或 VPS root 密码。
-- 第三方订阅导入建议设置 `SUBSCRIPTION_HOST_ALLOWLIST`，默认仅允许其中的 HTTPS 域名。
+- 第三方订阅导入仅允许 HTTPS 公网地址；本机、私网和保留地址会被拒绝。
 - 开启订阅保护时，所有正常订阅客户端也不能更新；恢复前请确认不需要在线更新。
 - 住宅代理端口只允许可信来源访问。
 - 后台自定义 Script 可以执行任意 JavaScript，只允许可信管理员使用。

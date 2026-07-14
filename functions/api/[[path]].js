@@ -163,11 +163,9 @@ function isPrivateSubscriptionHost(hostname) {
     return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
 }
 
-function validateSubscriptionUrl(value, env) {
+function validateSubscriptionUrl(value) {
     const url = new URL(value);
-    const allowed = String(env.SUBSCRIPTION_HOST_ALLOWLIST || '').split(',').map(host => host.trim().toLowerCase()).filter(Boolean);
     if (url.protocol !== 'https:' || url.username || url.password || url.hash || (url.port && url.port !== '443') || isPrivateSubscriptionHost(url.hostname)) throw new Error('订阅地址不安全');
-    if (!allowed.includes(url.hostname.toLowerCase())) throw new Error('订阅域名不在白名单中');
     return url;
 }
 
@@ -180,14 +178,14 @@ async function readBoundedText(response) {
     return new TextDecoder().decode(output);
 }
 
-async function fetchPublicSubscription(initialUrl, env) {
-    let current = validateSubscriptionUrl(initialUrl, env);
+async function fetchPublicSubscription(initialUrl) {
+    let current = validateSubscriptionUrl(initialUrl);
     for (let redirects = 0; redirects <= 3; redirects++) {
         const response = await fetch(current.toString(), { redirect: 'manual', headers: { 'User-Agent': 'v2rayN/6.44', 'Accept': '*/*' }, signal: AbortSignal.timeout(15000) });
         if (response.status >= 300 && response.status < 400) {
             const location = response.headers.get('Location');
             if (!location || redirects === 3) throw new Error('订阅重定向无效或过多');
-            current = validateSubscriptionUrl(new URL(location, current).toString(), env); continue;
+            current = validateSubscriptionUrl(new URL(location, current).toString()); continue;
         }
         if (!response.ok) throw new Error(`订阅请求失败: ${response.status}`);
         return response;
@@ -1643,12 +1641,12 @@ rules:
                 const { name, url } = await readJsonBody(request, 16 * 1024);
                 if (!url) return Response.json({ error: "请填写订阅链接" }, { status: 400 });
                 let subscriptionUrl;
-                try { subscriptionUrl = validateSubscriptionUrl(url, env); } catch (error) { return Response.json({ error: error.message || "订阅链接格式无效" }, { status: 400 }); }
+                try { subscriptionUrl = validateSubscriptionUrl(url); } catch (error) { return Response.json({ error: error.message || "订阅链接格式无效" }, { status: 400 }); }
                 const id = crypto.randomUUID();
                 const now = Date.now();
                 let parsedCount = 0; let parseDebug = {};
                 try {
-                    const res = await fetchPublicSubscription(subscriptionUrl.toString(), env);
+                    const res = await fetchPublicSubscription(subscriptionUrl.toString());
                     const text = await readBoundedText(res);
                     const result = await parseThirdPartySubscription(text);
                     const { nodes, protocolCounts, debug } = result;
