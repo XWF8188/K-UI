@@ -278,11 +278,10 @@ _residential_exit_ip = ""
 def _verify_residential_exit():
     global _residential_exit_ip
     for _ in range(4):
-        result = subprocess.run(["curl", "-fsSL", "--connect-timeout", "5", "--max-time", "15", "--proxy", "socks5://127.0.0.1:39482", "http://1.1.1.1/cdn-cgi/trace"], capture_output=True, text=True)
-        trace = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-        ip = trace.get("ip", "")
-        if result.returncode == 0 and ip and ip != VPS_IP and trace.get("warp", "off").lower() != "on":
-            if ip: _residential_exit_ip = ip
+        result = subprocess.run(["curl", "-4", "-fsSL", "--connect-timeout", "5", "--max-time", "15", "--proxy", "socks5h://127.0.0.1:39482", "https://api.ipify.org"], capture_output=True, text=True)
+        ip = result.stdout.strip()
+        if result.returncode == 0 and re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", ip) and ip != VPS_IP:
+            _residential_exit_ip = ip
             return True
         time.sleep(2)
     raise RuntimeError("residential proxy data-plane verification failed")
@@ -935,6 +934,10 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
                         singbox_config["route"]["rules"].insert(0, {"inbound": sorted(proxy_inbounds), "action": "sniff", "timeout": "1s"})
                         route_rule = {"domain_keyword": all_keywords, "domain_suffix": all_suffixes, "outbound": s5_tag}
                         singbox_config["route"]["rules"].append(route_rule)
+                        # Residential exits are IPv4-only. Prevent unmatched IPv6
+                        # requests from falling through to a previous/native path
+                        # after switching from WARP dual-stack to selective mode.
+                        singbox_config["route"]["rules"].append({"inbound": sorted(proxy_inbounds), "ip_version": 6, "action": "reject"})
                 else:
                     # 全局出站：所有非转发节点流量走 SOCKS5
                     existing_routed = set()
