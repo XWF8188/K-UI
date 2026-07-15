@@ -109,6 +109,14 @@ async function verifyAgent(header, ip, env) {
   return !!server?.agent_token && header === server.agent_token;
 }
 
+async function presenceName(ip, env) {
+  const server = await env.DB.prepare("SELECT agent_token FROM servers WHERE ip = ?").bind(ip).first();
+  if (!server?.agent_token) return "";
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(server.agent_token));
+  const tokenHash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+  return `v2:${ip}:${tokenHash}`;
+}
+
 function doRequest(path, request, headers = {}) {
   const outgoing = new Request(`https://durable.internal${path}`, request);
   for (const [name, value] of Object.entries(headers)) outgoing.headers.set(name, value);
@@ -127,7 +135,9 @@ export default {
       const role = url.searchParams.get("role") || "";
       if (!['core', 'proxy'].includes(role)) return json({ error: "Invalid role" }, 400);
       if (!(await verifyAgent(request.headers.get("Authorization"), ip, env))) return json({ error: "Unauthorized" }, 401);
-      const stub = env.VPS_PRESENCE.get(env.VPS_PRESENCE.idFromName(ip));
+      const name = await presenceName(ip, env);
+      if (!name) return json({ error: "VPS not found" }, 404);
+      const stub = env.VPS_PRESENCE.get(env.VPS_PRESENCE.idFromName(name));
       return stub.fetch(doRequest("/ws", request, { "X-KUI-IP": ip, "X-KUI-ROLE": role }));
     }
 
@@ -165,8 +175,10 @@ export default {
       if (!(await verifyAdmin(request.headers.get("Authorization"), request, env))) return json({ error: "Forbidden" }, 403, cors(request, env));
       const body = await request.json().catch(() => ({}));
       const ips = body.ip ? [body.ip] : (await env.DB.prepare("SELECT ip FROM servers").all()).results.map(row => row.ip);
-      await Promise.all(ips.slice(0, 100).map(ip => {
-        const stub = env.VPS_PRESENCE.get(env.VPS_PRESENCE.idFromName(ip));
+      await Promise.all(ips.slice(0, 100).map(async ip => {
+        const name = await presenceName(ip, env);
+        if (!name) return;
+        const stub = env.VPS_PRESENCE.get(env.VPS_PRESENCE.idFromName(name));
         return stub.fetch(new Request("https://presence.internal/notify", { method: "POST" }));
       }));
       return json({ success: true, notified: ips.length }, 200, cors(request, env));
@@ -510,7 +522,9 @@ export class DashboardHub extends DurableObject {
     const proxyMap = new Map(proxies.map(row => [row.ip, row]));
     const snapshots = await Promise.all(servers.slice(0, 100).map(async row => {
       const { ip } = row;
-      const presence = this.env.VPS_PRESENCE.get(this.env.VPS_PRESENCE.idFromName(ip));
+      const name = await presenceName(ip, this.env);
+      if (!name) return null;
+      const presence = this.env.VPS_PRESENCE.get(this.env.VPS_PRESENCE.idFromName(name));
       const response = await presence.fetch(new Request("https://presence.internal/snapshot"));
       const live = response.ok ? await response.json() : null;
       if (live?.ip && (live.core || live.proxy)) return live;
@@ -585,8 +599,10 @@ export class DashboardHub extends DurableObject {
     this.activityUntil = until;
     this.activityInterval = interval;
     const servers = (await this.env.DB.prepare("SELECT ip FROM servers").all()).results || [];
-    await Promise.all(servers.slice(0, 100).map(({ ip }) => {
-      const presence = this.env.VPS_PRESENCE.get(this.env.VPS_PRESENCE.idFromName(ip));
+    await Promise.all(servers.slice(0, 100).map(async ({ ip }) => {
+      const name = await presenceName(ip, this.env);
+      if (!name) return;
+      const presence = this.env.VPS_PRESENCE.get(this.env.VPS_PRESENCE.idFromName(name));
       return presence.fetch(new Request("https://presence.internal/dashboard-active", { method: "POST", headers: { "X-KUI-Active": active ? "1" : "0", "X-KUI-Interval": String(interval), "X-KUI-Until": String(until) } }));
     }));
   }
